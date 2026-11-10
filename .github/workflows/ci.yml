@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+  # The release workflow runs the whole suite before publishing.
+  workflow_call:
+  # Weekly run: the SDKs are only lower-bounded, so a new release of
+  # openai/anthropic/google-genai/ollama can break us without a commit.
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.3.3
+      - run: uvx ruff check .
+
+  test:
+    name: Test (Python ${{ matrix.python }}, ${{ matrix.resolution }} dependencies)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+        resolution: [highest]
+        include:
+          # The oldest versions pyproject.toml allows must really work.
+          - python: "3.12"
+            resolution: lowest-direct
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.3.3
+      - name: Run the tests
+        run: uv run --isolated --python ${{ matrix.python }} --resolution ${{ matrix.resolution }} pytest -ra
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.3.3
+      - name: Run the tests with coverage
+        run: >
+          uv run --isolated --python 3.12 --with pytest-cov
+          pytest --cov=hiyal --cov-branch --cov-report=term-missing:skip-covered
+          --cov-report=xml --cov-fail-under=95
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  build:
+    name: Build and check the package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.3.3
+      - name: Versions agree
+        run: uv run --no-project --python 3.12 python .github/scripts/check_version.py
+      - name: Build the sdist and wheel
+        run: uv build
+      - name: Check the metadata
+        run: uvx twine check dist/*
+      - name: Install the wheel in a clean environment and import it
+        run: |
+          uv venv "$RUNNER_TEMP/smoke" --python 3.12
+          uv pip install --python "$RUNNER_TEMP/smoke/bin/python" dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/smoke/bin/python" -c "
+          import hiyal
+          from hiyal.models import LLM, AnthropicLLM, DeepSeekLLM, GeminiLLM, OllamaLLM, OpenAILLM
+          from hiyal.prompts import UserPrompt
+          from hiyal.tools import tool
+          from hiyal.models.openai import ChatCompletionsTranslator
+          print('hiyal', hiyal.__version__, 'imports OK')
+          "
+      - uses: actions/upload-artifact@v7
+        with:
+          # Not "dist": release.yml calls this workflow and uploads its own "dist"
+          # in the same run, and artifact names must be unique within a run.
+          name: dist-ci
+          path: dist/
+          if-no-files-found: error
+
+  # One stable name for branch protection: require "CI passed" and nothing else.
+  ci-passed:
+    name: CI passed
+    if: always()
+    needs: [lint, test, coverage, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any job failed or was cancelled
+        env:
+          BAD: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          test "$BAD" = "false"

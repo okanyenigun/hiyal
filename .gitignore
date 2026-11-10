@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+uv.lock
+.env
+# Files written by the multimodal notebooks
+multimodal/outputs/
+
+private/
+# Test and tool output
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+.ruff_cache/

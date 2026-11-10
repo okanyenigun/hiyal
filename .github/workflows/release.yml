@@ -1,0 +1,109 @@
+name: Release
+
+# Publishing a release:
+#   1. Bump the version in pyproject.toml and src/hiyal/__init__.py, merge to master.
+#   2. git tag v<version> && git push origin v<version>
+# That runs the full test suite, builds the package, publishes it to PyPI
+# (after approval of the "pypi" environment) and creates the GitHub release.
+#
+# To rehearse on TestPyPI without a tag, run this workflow by hand from the
+# Actions tab; it publishes the current master to TestPyPI only.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: Tests
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build distributions
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.3.3
+      - name: The tag, pyproject.toml and hiyal.__version__ agree
+        if: github.ref_type == 'tag'
+        run: uv run --no-project --python 3.12 python .github/scripts/check_version.py "$GITHUB_REF_NAME"
+      - name: The versions agree
+        if: github.ref_type != 'tag'
+        run: uv run --no-project --python 3.12 python .github/scripts/check_version.py
+      - run: uv build
+      - run: uvx twine check dist/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/hiyal/
+    permissions:
+      id-token: write # trusted publishing: no API token is stored anywhere
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: Create the GitHub release
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # 0.1.0a1, 0.1.0rc1, 0.1.0.dev1 ... are pre-releases.
+          flags=""
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then flags="--prerelease"; fi
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" --generate-notes --verify-tag $flags
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/hiyal/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
