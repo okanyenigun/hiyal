@@ -1,7 +1,7 @@
 [project]
 name = "hiyal"
 version = "0.0.1"
-description = "One Python interface for OpenAI, Anthropic, Gemini, Ollama and DeepSeek."
+description = "Hiyal is an agentic tool. Currently it provides the LLM call component."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
