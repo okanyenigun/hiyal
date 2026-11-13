@@ -124,6 +124,30 @@ class TestRender:
         assert not prompt.has_media
 
 
+class TestEntryCap:
+    def test_a_long_entry_is_cut_and_says_how_much(self):
+        long = ContextEntry(text="x" * 50)
+        prompt = Summarizer(FakeLLM(), max_entry_chars=20).render([long])
+        cut = long.to_text()[:20]
+        assert prompt.text == f"Conversation to summarize:\n{cut}... ({len(long.to_text()) - 20:,} more characters cut)"
+
+    def test_entries_within_the_cap_and_the_stored_entry_stay_whole(self):
+        entries = conversation()
+        before = [entry.to_text() for entry in entries]
+        assert Summarizer(FakeLLM(), max_entry_chars=1000).render(entries).text == RENDERED
+        assert [entry.to_text() for entry in entries] == before
+
+    def test_without_a_cap_nothing_is_cut(self):
+        long = ContextEntry(text="x" * 10_000)
+        assert long.to_text() in Summarizer(FakeLLM()).render([long]).text
+
+    def test_chunking_counts_the_cut_text(self):
+        # Uncut, the 300 words need several chunks; cut to 40 characters, they fit one call.
+        llm = ScriptedLLM("The summary.")
+        Summarizer(llm, chunk_tokens=50, max_entry_chars=40).summarize([ContextEntry(text="w " * 300)])
+        assert len(llm.calls) == 1
+
+
 class TestPlain:
     def test_with_no_options_one_call_with_the_instructions_and_the_rendered_entries(self):
         llm = FakeLLM()
@@ -283,6 +307,8 @@ class TestSettings:
         ({"min_decrease": 1}, r"min_decrease must be a number in \[0, 1\)"),
         ({"budget_aim": 0}, r"budget_aim must be a number in \(0, 1\]"),
         ({"chunk_aim": 1.5}, r"chunk_aim must be a number in \(0, 1\]"),
+        ({"max_entry_chars": 0}, "max_entry_chars must be a positive integer"),
+        ({"max_entry_chars": True}, "max_entry_chars must be a positive integer"),
     ])
     def test_invalid_settings(self, settings, message):
         with pytest.raises(ValueError, match=message):

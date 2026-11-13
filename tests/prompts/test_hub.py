@@ -29,6 +29,12 @@ class TestPromptHub:
     def test_the_shipped_summarize_prompt_is_there(self):
         assert hub.get("memory/summarize", "v1").startswith("You summarize a conversation")
 
+    def test_summarize_v2_asks_for_fixed_headings(self):
+        v2 = hub.get("memory/summarize", "v2")
+        headings = ["LANGUAGE:", "INTENT:", "SUMMARY:", "TOOLS:", "ARTIFACTS:", "NEXT STEPS:"]
+        assert [v2.index(h) for h in headings] == sorted(v2.index(h) for h in headings)
+        assert 'Write "None"' in v2 and Summarizer(llm=None, prompt_version="v2").instructions == v2
+
 
 class TestSummarizerUsesTheHub:
     def test_by_default_the_hub_prompt(self):

@@ -12,12 +12,14 @@ from ....prompts.hub import hub
 
 
 class Summarizer(BaseSummarizer):
-    """Summarizes entries as text; focus, chunking and a token budget are switched on by parameters.
+    """Summarizes entries as text; focus, chunking, a token budget and a cap per entry are switched on by parameters.
 
     ==========  ==================  ============================================
     Behaviour   Switched on by      What it adds
     ==========  ==================  ============================================
     text        (always)            each entry's ``to_text()``, in one call
+    cap         ``max_entry_chars`` each entry's text cut to this length, so
+                                    one huge entry cannot fill the call
     focus       ``focus``           what the summary is for, in every call's
                                     system prompt
     chunking    ``chunk_tokens``    map-reduce when the text is too long for
@@ -67,6 +69,7 @@ class Summarizer(BaseSummarizer):
         min_decrease: float = 0.1,
         budget_aim: float = 0.75,
         chunk_aim: float = 0.25,
+        max_entry_chars: int | None = None,
         encoding: str = DEFAULT_ENCODING,
     ) -> None:
         """Configure the behaviours; every keyword left out leaves its behaviour off.
@@ -89,15 +92,23 @@ class Summarizer(BaseSummarizer):
           combines) aim at this share of ``chunk_tokens``, so several of
           their summaries fit one combine call and each combine level
           shrinks the pieces.
+        - ``max_entry_chars``: the most characters of one entry's text sent
+          to the model; the rest is cut, with a note saying how much (only
+          what is sent: the entry itself stays whole). For example ``2000``,
+          so one huge tool output cannot fill a summary call or the summary.
         - ``encoding``: the tiktoken encoding for every count.
 
-        Raises ``ValueError`` for a blank focus, a ``chunk_tokens`` or
-        ``max_tokens`` that is not a positive integer, a negative
+        Raises ``ValueError`` for a blank focus, a ``chunk_tokens``,
+        ``max_tokens`` or ``max_entry_chars`` that is not a positive integer, a negative
         ``max_rounds``, a ``min_decrease`` outside ``[0, 1)``, a
         ``budget_aim`` or ``chunk_aim`` outside ``(0, 1]``, or an unknown
         encoding.
         """
-        for name, value in (("chunk_tokens", chunk_tokens), ("max_tokens", max_tokens)):
+        for name, value in (
+            ("chunk_tokens", chunk_tokens),
+            ("max_tokens", max_tokens),
+            ("max_entry_chars", max_entry_chars),
+        ):
             if value is not None:
                 Checks.positive_int(value, name)
         if (
@@ -133,6 +144,7 @@ class Summarizer(BaseSummarizer):
         self.min_decrease = min_decrease
         self.budget_aim = budget_aim
         self.chunk_aim = chunk_aim
+        self.max_entry_chars = max_entry_chars
         self.encoding = Tokens.require_encoding(encoding)
 
     @property
@@ -196,7 +208,7 @@ class Summarizer(BaseSummarizer):
     def render(
         self, entries: list[Entry], previous: SummaryEntry | None = None
     ) -> UserPrompt:
-        """The previous summary, then each entry's ``to_text()``; media are their placeholders.
+        """The previous summary, then each entry's text (see ``_text``); media are their placeholders.
 
         The prompt reads::
 
@@ -204,12 +216,20 @@ class Summarizer(BaseSummarizer):
             <the previous summary, when rolling>
 
             Conversation to summarize:
-            <each entry's to_text(), separated by blank lines>
+            <each entry's text, separated by blank lines>
         """
         parts = [f"Previous summary:\n{previous.text}"] if previous is not None else []
-        conversation = "\n\n".join(entry.to_text() for entry in entries)
+        conversation = "\n\n".join(self._text(entry) for entry in entries)
         parts.append(f"Conversation to summarize:\n{conversation}")
         return UserPrompt(text="\n\n".join(parts))
+
+    def _text(self, entry: Entry) -> str:
+        """``entry.to_text()``, cut to ``max_entry_chars`` when it is set, saying how much was cut."""
+        text = entry.to_text()
+        if self.max_entry_chars is None or len(text) <= self.max_entry_chars:
+            return text
+        cut = len(text) - self.max_entry_chars
+        return f"{text[: self.max_entry_chars]}... ({cut:,} more characters cut)"
 
     # ------------------------------------------------------------------ chunking
 
@@ -217,13 +237,13 @@ class Summarizer(BaseSummarizer):
         self, entries: list[Entry], previous: SummaryEntry | None, whole: UserPrompt
     ) -> LLMResponse:
         """Summarize each chunk of ``entries``, then combine the chunk summaries (``previous`` first)."""
-        spans = self._spans([self._count(entry.to_text()) for entry in entries])
+        spans = self._spans([self._count(self._text(entry)) for entry in entries])
         if len(spans) == 1 and previous is None:
             # The entries fit one chunk, only the prompt header tips it over: one call is still right.
             return self.query(self.system("summarize", self._aim(final=True)), whole)
         pieces = [previous.text] if previous is not None else []
         for number, (start, end) in enumerate(spans, 1):
-            conversation = "\n\n".join(entry.to_text() for entry in entries[start:end])
+            conversation = "\n\n".join(self._text(entry) for entry in entries[start:end])
             part = UserPrompt(
                 text=f"Part {number} of {len(spans)} of a longer conversation; the other parts are "
                 f"summarized separately. Conversation to summarize:\n{conversation}"
@@ -237,7 +257,7 @@ class Summarizer(BaseSummarizer):
         self, entries: list[Entry], previous: SummaryEntry | None, whole: UserPrompt
     ) -> LLMResponse:
         """``_map_reduce``, with the chunks summarized at the same time."""
-        spans = self._spans([self._count(entry.to_text()) for entry in entries])
+        spans = self._spans([self._count(self._text(entry)) for entry in entries])
         if len(spans) == 1 and previous is None:
             return await self.query_async(
                 self.system("summarize", self._aim(final=True)), whole
@@ -245,7 +265,7 @@ class Summarizer(BaseSummarizer):
         system = self.system("summarize", self._aim(final=False))
         parts = []
         for number, (start, end) in enumerate(spans, 1):
-            conversation = "\n\n".join(entry.to_text() for entry in entries[start:end])
+            conversation = "\n\n".join(self._text(entry) for entry in entries[start:end])
             parts.append(
                 UserPrompt(
                     text=f"Part {number} of {len(spans)} of a longer conversation; the other parts are "
