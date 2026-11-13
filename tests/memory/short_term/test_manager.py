@@ -695,6 +695,20 @@ class TestNotes:
         manager.refresh_notes()
         assert sent(llm) == "User: q2\n\nUser: q3" and manager.notes["destination"] == "Tokyo"
 
+    def test_an_answer_that_leaves_out_sections_keeps_the_notes_and_the_entries_for_the_next_update(self):
+        kept = notes_json(destination="Kyoto", constraints=["Direct flights only"])
+        manager, llm = noting([UserPrompt(text="q1")], kept, json.dumps({"destination": "Kyoto"}),
+                              notes_json(destination="Kyoto", constraints=["Direct flights only", "Vegetarian"]))
+        manager.refresh_notes()
+        manager.add(UserPrompt(text="q2"))
+        with pytest.raises(ValueError, match="leave out sections that had content: constraints"):
+            manager.refresh_notes()
+        assert manager.notes["constraints"] == ["Direct flights only"]  # not wiped
+        manager.add(UserPrompt(text="q3"))
+        manager.refresh_notes()
+        assert sent(llm) == "User: q2\n\nUser: q3"  # the refused update's entries were not lost
+        assert manager.notes["constraints"] == ["Direct flights only", "Vegetarian"]
+
     def test_a_continued_session_restores_the_notes_and_what_arrived_since(self):
         storage = InMemoryStorage()
         first = ShortTermMemoryManager(storage, note_taker=NoteTaker(FakeLLM(notes_json(destination="Kyoto")),

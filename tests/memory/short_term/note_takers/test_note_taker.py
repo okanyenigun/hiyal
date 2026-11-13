@@ -99,6 +99,31 @@ class TestNoteTaker:
         assert llm.calls == []
 
 
+class TestLeftOutSections:
+    """A section that had content must be in the answer; emptying it on purpose is fine."""
+
+    NOTES = {"destination": "Kyoto", "constraints": ["Direct flights only"], "next_step": "Book hotels"}
+
+    def test_an_answer_that_leaves_out_sections_with_content_is_refused(self):
+        llm = FakeLLM(json.dumps({"destination": "Kyoto"}))  # fits TripNotes: the other sections have defaults
+        with pytest.raises(ValueError, match="leave out sections that had content: constraints, next_step"):
+            NoteTaker(llm, schema=TripNotes).update(self.NOTES, [context("a")])
+
+    def test_a_section_emptied_on_purpose_is_accepted(self):
+        llm = FakeLLM(json.dumps({"destination": "Kyoto", "constraints": [], "next_step": None}))
+        update = NoteTaker(llm, schema=TripNotes).update(self.NOTES, [context("Hotels booked; any flight is fine.")])
+        assert update.notes == {"destination": "Kyoto", "constraints": [], "next_step": None}
+
+    def test_left_out_sections_that_were_empty_are_fine(self):
+        llm = FakeLLM(json.dumps({"destination": "Osaka"}))
+        update = NoteTaker(llm, schema=TripNotes).update({"destination": "Kyoto", "constraints": []}, [context("a")])
+        assert update.notes["destination"] == "Osaka"
+
+    def test_the_first_notes_have_nothing_to_lose(self):
+        update = NoteTaker(FakeLLM(json.dumps({"destination": "Kyoto"})), schema=TripNotes).update(None, [context("a")])
+        assert update.notes["destination"] == "Kyoto"
+
+
 class TestAsync:
     def test_a_note_taker_without_its_own_async_update_runs_update_in_a_thread(self):
         class Fixed(BaseNoteTaker):
