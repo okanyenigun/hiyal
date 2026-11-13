@@ -28,7 +28,7 @@ def every_memory_entry():
         ContextEntry(text="Budget is $3,000", source="long_term_memory"),
         ToolResultEntry(message_id="item_1", call_id="call_1", name="get_weather", arguments={"city": "Kyoto"},
                         output={"c": 21}),
-        SummaryEntry(text="Trip to Japan in April.", covers=["a", "b"]),
+        SummaryEntry(text="Trip to Japan in April.", covers_through="b", covers_count=2),
         WorkingNotesEntry(notes={"objective": "Compare three technologies", "decisions": []}),
     ]
 
@@ -122,8 +122,16 @@ class TestToText:
             ToolResultEntry(message_id="m", name="get_weather", output="Mild")
 
     def test_summary(self):
-        assert SummaryEntry(text="Trip to Japan.", covers=["a"]).to_text() == \
+        assert SummaryEntry(text="Trip to Japan.", covers_through="a", covers_count=1).to_text() == \
             "Summary of the earlier conversation:\nTrip to Japan."
+
+    def test_a_summary_covers_everything_up_to_its_last_entry_except_its_exceptions(self):
+        summary = SummaryEntry(text="s", covers_through="d", covers_except=["a", "c"], covers_count=2)
+        assert summary.covered(["a", "b", "c", "d", "e"]) == ["b", "d"]
+
+    def test_a_summary_whose_last_entry_was_removed_covers_nothing_it_can_tell(self):
+        summary = SummaryEntry(text="s", covers_through="d", covers_count=4)
+        assert summary.covered(["a", "b", "c", "e"]) == []
 
     def test_notes_show_one_bullet_per_section(self):
         entry = WorkingNotesEntry(notes={"destination": "Kyoto", "decisions": ["Fly direct", "Stay central"],

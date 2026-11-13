@@ -1,7 +1,8 @@
 """Compaction that folds new entries into the previous summary."""
 
-from .base import BaseCompaction, SummaryUpdate
+from .base import BaseCompaction
 from ..entry import Entry, SummaryEntry
+from ....models.schemas import LLMResponse
 
 
 class RollingCompaction(BaseCompaction):
@@ -16,16 +17,14 @@ class RollingCompaction(BaseCompaction):
 
     def compact(
         self, newly: list[Entry], previous: SummaryEntry | None, covered: list[Entry]
-    ) -> SummaryUpdate:
+    ) -> LLMResponse:
         """Fold ``newly`` into ``previous``; ``covered`` is not needed."""
         self._require_entries(newly)
-        return self._update(self.summarizer.summarize(newly, previous), previous, newly)
+        return self.summarizer.summarize(newly, previous)
 
     async def compact_async(
         self, newly: list[Entry], previous: SummaryEntry | None, covered: list[Entry]
-    ) -> SummaryUpdate:
+    ) -> LLMResponse:
         """``compact``, with ``summarizer.summarize_async``."""
         self._require_entries(newly)
-        return self._update(
-            await self.summarizer.summarize_async(newly, previous), previous, newly
-        )
+        return await self.summarizer.summarize_async(newly, previous)

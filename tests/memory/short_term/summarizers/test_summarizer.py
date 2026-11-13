@@ -112,7 +112,7 @@ class TestRender:
         assert prompt.text == RENDERED and not prompt.has_media
 
     def test_a_previous_summary_comes_first(self):
-        previous = SummaryEntry(text="Trip planning started.", covers=["x"])
+        previous = SummaryEntry(text="Trip planning started.", covers_through="x", covers_count=1)
         prompt = Summarizer(FakeLLM()).render(conversation(), previous)
         assert prompt.text == f"Previous summary:\nTrip planning started.\n\n{RENDERED}"
 
@@ -222,7 +222,7 @@ class TestChunking:
 
     def test_the_previous_summary_is_the_oldest_part(self):
         llm = ScriptedLLM(words(5), words(5), "Combined.")
-        previous = SummaryEntry(text="Earlier.", covers=["x"])
+        previous = SummaryEntry(text="Earlier.", covers_through="x", covers_count=1)
         Summarizer(llm, chunk_tokens=40).summarize(notes(15, 15, 15), previous)
         assert llm.calls[2]["user_prompt"].text.split("\n\n")[1] == "Part 1:\nEarlier."
 

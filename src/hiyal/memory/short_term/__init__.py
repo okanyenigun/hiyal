@@ -1,4 +1,4 @@
-from .compaction import BaseCompaction, RebuildCompaction, RollingCompaction, SummaryUpdate
+from .compaction import BaseCompaction, RebuildCompaction, RollingCompaction
 from .entry import (
     ContextEntry,
     Entry,
@@ -6,7 +6,7 @@ from .entry import (
     ToolResultEntry,
     WorkingNotesEntry,
 )
-from .manager import ShortTermMemoryManager
+from .manager import ShortTermMemoryManager, SummaryUpdate
 from .note_takers import BaseNoteTaker, NoteTaker, NotesUpdate
 from .policies import (
     BasePolicy,

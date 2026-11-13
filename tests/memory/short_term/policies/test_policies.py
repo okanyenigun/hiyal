@@ -88,7 +88,7 @@ class TestTypeFilterPolicy:
         question = UserPrompt(text="q")
         context = ContextEntry(text="c")
         result = ToolResultEntry(message_id="m", name="f", arguments={}, output=1)
-        summary = SummaryEntry(text="s", covers=["x"])
+        summary = SummaryEntry(text="s", covers_through="x", covers_count=1)
         policy = TypeFilterPolicy(exclude=[ToolResultEntry, SummaryEntry])
         assert policy.select([question, result, context, summary]) == [question, context]
 

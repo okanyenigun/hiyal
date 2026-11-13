@@ -1,17 +1,27 @@
 """The component that manages a session's short-term memory."""
 
 import asyncio
+from dataclasses import dataclass
 from typing import Self
 from uuid import uuid4
 from pydantic import JsonValue
-from .compaction import BaseCompaction, SummaryUpdate
+from .compaction import BaseCompaction
 from .entry import Entry, SummaryEntry, WorkingNotesEntry, finishes_turn, is_derived
 from .note_takers import BaseNoteTaker, NotesUpdate
 from .policies import BasePolicy, FullPolicy
 from .storage import BaseStorage
+from ...models.schemas import LLMResponse
 from ...prompts import SystemPrompt
 from ...utility import Checks, Tokens
 from ...utility.tokens import DEFAULT_ENCODING
+
+
+@dataclass(frozen=True)
+class SummaryUpdate:
+    """A new summary, and the summarizer's response (for its token usage)."""
+
+    summary: SummaryEntry
+    response: LLMResponse
 
 
 class ShortTermMemoryManager:
@@ -50,13 +60,15 @@ class ShortTermMemoryManager:
     - **The summary** stands for the entries that left the window. With a
       ``compaction``, whatever the policy's window drops is summarized in the
       same ``add``: the compaction gets the current summary and only the
-      dropped entries, and returns the summary that replaces it. So every
-      entry is in the window, in the summary, or excluded by a filter, and
-      the policy sets the rhythm (a ``SlidingWindowPolicy`` gives one summary
-      per jump of ``step`` entries; ``LastNPolicy`` one per ``add``). The
-      summary's ``covers`` lists every entry it stands for, so nothing is
-      summarized twice. There is one summary at most, always first in
-      ``active``; it is never in the window, so the policy cannot drop it.
+      dropped entries, and writes the text of the summary that replaces it.
+      So every entry is in the window, in the summary, or excluded by a
+      filter, and the policy sets the rhythm (a ``SlidingWindowPolicy``
+      gives one summary per jump of ``step`` entries; ``LastNPolicy`` one
+      per ``add``). The manager records what each summary stands for
+      (everything up to ``covers_through``, except ``covers_except``), so
+      nothing is summarized twice. There is one summary at most, always
+      first in ``active``; it is never in the window, so the policy cannot
+      drop it.
       Old system prompts that leave the window are instructions, not
       conversation: they are not summarized. Entries the policy's
       **filters** exclude (``TypeFilterPolicy``, alone or first in a
@@ -125,7 +137,12 @@ class ShortTermMemoryManager:
 
         ``compaction`` summarizes whatever the window leaves out, as it
         leaves; ``None`` means what leaves is forgotten. What the policy's
-        filters exclude is never summarized.
+        filters exclude is never summarized. Each time entries leave is one
+        compaction call, so pick a policy that drops them in batches:
+        ``LastNPolicy`` drops one entry per add once full, which means an
+        LLM call on every add and a new summary that breaks the provider's
+        prompt cache each time; ``SlidingWindowPolicy`` with a ``step`` of
+        several entries summarizes once every ``step`` adds.
 
         ``note_taker`` writes the working notes: automatically once
         ``notes_every`` turns have finished since the last version, or
@@ -228,6 +245,12 @@ class ShortTermMemoryManager:
         self._adds_since_dump: int = 0
         # IDs in the primary storage, so a duplicate is caught without reading it.
         self._ids: set[str] = {entry.id_ for entry in stored}
+        # IDs of the original entries (not summaries or notes), in history
+        # order, and where each one is: what a summary's coverage is read against.
+        self._originals: list[str] = [e.id_ for e in stored if not is_derived(e)]
+        self._position: dict[str, int] = {
+            entry_id: i for i, entry_id in enumerate(self._originals)
+        }
         # IDs of every system prompt, so pin() can refuse them without reading them.
         self._system_ids: set[str] = {
             e.id_ for e in stored if isinstance(e, SystemPrompt)
@@ -347,6 +370,8 @@ class ShortTermMemoryManager:
     def _record(self, entry: Entry) -> str | None:
         """Count the stored ``entry`` in; for a system prompt, pin it and return the previous one's ID."""
         self._ids.add(entry.id_)
+        self._position[entry.id_] = len(self._originals)
+        self._originals.append(entry.id_)
         self._since_notes.append(entry.id_)
         self._turns_since_notes += finishes_turn(entry)
         self._adds_since_dump += 1
@@ -396,6 +421,12 @@ class ShortTermMemoryManager:
         A one-time squeeze: on the next adds, the policy chooses from the
         smaller window, so it can grow again. What was summarized never
         comes back.
+
+        When calling it on a token limit, squeeze to well below that limit,
+        e.g. ``compact(max_tokens=limit // 2)`` once the window passes
+        ``limit``. Squeezing to the limit itself leaves the window just
+        under it, so the next add passes it again and every add compacts
+        (an LLM call each time).
 
         Returns the compaction's ``SummaryUpdate`` (with its token usage), or
         ``None`` when nothing was summarized (the window already fits).
@@ -700,7 +731,11 @@ class ShortTermMemoryManager:
         summary = next(
             (entry for entry in entries if entry.id_ == self._summary_id), None
         )
-        covered = set(summary.covers) if isinstance(summary, SummaryEntry) else set()
+        covered = (
+            set(summary.covered([e.id_ for e in entries if not is_derived(e)]))
+            if isinstance(summary, SummaryEntry)
+            else set()
+        )
         replaced = {
             e.id_
             for e in entries
@@ -777,28 +812,58 @@ class ShortTermMemoryManager:
         assert self.compaction is not None
         previous = self.summary
         covered = (
-            self.storage.get(self.session_id, previous.covers)
+            self.storage.get(self.session_id, previous.covered(self._originals))
             if previous is not None and self.compaction.uses_covered
             else []
         )
-        update = self.compaction.compact(dropped, previous, covered)
-        self.storage.add(self.session_id, update.summary)
-        self._install_summary(update.summary)
-        return update
+        response = self.compaction.compact(dropped, previous, covered)
+        summary = self._next_summary(response, previous, dropped)
+        self.storage.add(self.session_id, summary)
+        self._install_summary(summary)
+        return SummaryUpdate(summary, response)
 
     async def _summarize_async(self, dropped: list[Entry]) -> SummaryUpdate:
         """``_summarize``, with async I/O."""
         assert self.compaction is not None
         previous = await self.summary_async()
         covered = (
-            await self.storage.get_async(self.session_id, previous.covers)
+            await self.storage.get_async(
+                self.session_id, previous.covered(self._originals)
+            )
             if previous is not None and self.compaction.uses_covered
             else []
         )
-        update = await self.compaction.compact_async(dropped, previous, covered)
-        await self.storage.add_async(self.session_id, update.summary)
-        self._install_summary(update.summary)
-        return update
+        response = await self.compaction.compact_async(dropped, previous, covered)
+        summary = self._next_summary(response, previous, dropped)
+        await self.storage.add_async(self.session_id, summary)
+        self._install_summary(summary)
+        return SummaryUpdate(summary, response)
+
+    def _next_summary(
+        self, response: LLMResponse, previous: SummaryEntry | None, dropped: list[Entry]
+    ) -> SummaryEntry:
+        """The summary with ``response``'s text, covering what ``previous`` covered plus ``dropped``.
+
+        It covers up to the newest of them; the original entries before that
+        it does not cover (pinned, filtered, system prompts, still in the
+        window) are its exceptions. Only the entries after ``previous``'s
+        last one are looked at, so this does not grow with the history.
+        """
+        new = {entry.id_ for entry in dropped}
+        if previous is not None and previous.covers_through in self._position:
+            start = self._position[previous.covers_through] + 1
+            skipped = [i for i in previous.covers_except if i not in new]
+        else:  # the first summary, or the previous one's end was removed: start over
+            start, skipped = 0, []
+        end = max(start, *(self._position[entry_id] + 1 for entry_id in new))
+        skipped += [i for i in self._originals[start:end] if i not in new]
+        count = (previous.covers_count if previous is not None else 0) + len(new)
+        return SummaryEntry(
+            text=response.text,
+            covers_through=self._originals[end - 1],
+            covers_except=skipped,
+            covers_count=count,
+        )
 
     def _install_summary(self, summary: SummaryEntry) -> None:
         """Make the stored ``summary`` the current one."""

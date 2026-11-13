@@ -8,7 +8,6 @@ from hiyal.memory.short_term import (
     RebuildCompaction,
     RollingCompaction,
     SummaryEntry,
-    SummaryUpdate,
 )
 from hiyal.memory.short_term.summarizers import BaseSummarizer
 from hiyal.models.schemas import LLMResponse
@@ -63,26 +62,23 @@ def turns(count, start=1):
     return entries
 
 
-def ids(entries):
-    return [entry.id_ for entry in entries]
+def summary_of(entries, text="earlier"):
+    """A summary covering ``entries``, as the manager records it."""
+    return SummaryEntry(text=text, covers_through=entries[-1].id_, covers_count=len(entries))
 
 
 class TestRollingCompaction:
-    def test_the_first_summary_covers_the_new_entries(self):
+    def test_the_first_summary_is_the_summarizers_response(self):
         summarizer = FakeSummarizer()
-        newly = turns(2)
-        update = RollingCompaction(summarizer).compact(newly, None, [])
-        assert isinstance(update, SummaryUpdate) and update.response.text == update.summary.text
+        response = RollingCompaction(summarizer).compact(turns(2), None, [])
+        assert isinstance(response, LLMResponse) and response.text
         assert summarizer.calls == [(["q1", "a1", "q2", "a2"], None)]
-        assert update.summary.covers == ids(newly)
 
     def test_folds_only_the_new_entries_into_the_previous_summary(self):
         summarizer = FakeSummarizer()
         old, newly = turns(2), turns(1, start=3)
-        previous = SummaryEntry(text="earlier", covers=ids(old))
-        update = RollingCompaction(summarizer).compact(newly, previous, old)
+        RollingCompaction(summarizer).compact(newly, summary_of(old), old)
         assert summarizer.calls == [(["q3", "a3"], "earlier")]  # the originals are not resent
-        assert update.summary.covers == ids(old) + ids(newly)
 
     def test_nothing_new_to_summarize(self):
         with pytest.raises(ValueError, match="nothing to summarize"):
@@ -93,18 +89,14 @@ class TestRebuildCompaction:
     def test_rebuilds_from_the_originals_without_the_previous_summary(self):
         summarizer = FakeSummarizer()
         old, newly = turns(2), turns(1, start=3)
-        previous = SummaryEntry(text="earlier", covers=ids(old))
-        update = RebuildCompaction(summarizer).compact(newly, previous, old)
+        RebuildCompaction(summarizer).compact(newly, summary_of(old), old)
         assert summarizer.calls == [(["q1", "a1", "q2", "a2", "q3", "a3"], None)]
-        assert update.summary.covers == ids(old) + ids(newly)
 
     def test_falls_back_on_the_previous_summary_for_originals_that_are_gone(self):
         summarizer = FakeSummarizer()
         old, newly = turns(2), turns(1, start=3)
-        previous = SummaryEntry(text="earlier", covers=ids(old))
-        update = RebuildCompaction(summarizer).compact(newly, previous, old[1:])  # q1 is gone
+        RebuildCompaction(summarizer).compact(newly, summary_of(old), old[1:])  # q1 is gone
         assert summarizer.calls == [(["a1", "q2", "a2", "q3", "a3"], "earlier")]
-        assert update.summary.covers == ids(old) + ids(newly)  # still covers q1
 
     def test_nothing_new_to_summarize(self):
         with pytest.raises(ValueError, match="nothing to summarize"):
@@ -115,8 +107,7 @@ class TestAsync:
     def test_a_compaction_without_its_own_async_compact_runs_compact_in_a_thread(self):
         class Fixed(BaseCompaction):
             def compact(self, newly, previous, covered):
-                return SummaryUpdate(SummaryEntry(text="s", covers=ids(newly)), reply("s"))
+                return reply("s")
 
-        newly = turns(1)
-        update = asyncio.run(Fixed(FakeSummarizer()).compact_async(newly, None, []))
-        assert update.summary.covers == ids(newly)
+        response = asyncio.run(Fixed(FakeSummarizer()).compact_async(turns(1), None, []))
+        assert response.text == "s"

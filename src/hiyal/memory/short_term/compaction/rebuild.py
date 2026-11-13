@@ -1,43 +1,37 @@
 """Compaction that rebuilds the summary from the original entries."""
 
-from .base import BaseCompaction, SummaryUpdate
+from .base import BaseCompaction
 from ..entry import Entry, SummaryEntry
+from ....models.schemas import LLMResponse
 
 
 class RebuildCompaction(BaseCompaction):
     """Sends all the original entries again: those the previous summary covers, then the new ones.
 
     Rebuilding from originals avoids summary drift, at the cost of sending
-    more each time. Originals that are no longer available (e.g. removed,
-    or moved to a dump) are replaced by the previous summary's text, sent
+    more each time. When some originals are no longer available (e.g.
+    removed, or moved to a dump), the previous summary's text is sent too,
     as the previous summary.
     """
 
     def compact(
         self, newly: list[Entry], previous: SummaryEntry | None, covered: list[Entry]
-    ) -> SummaryUpdate:
+    ) -> LLMResponse:
         """Summarize ``covered`` and ``newly`` from scratch; fall back on ``previous`` for missing originals."""
         entries, fallback = self._inputs(newly, previous, covered)
-        return self._update(
-            self.summarizer.summarize(entries, fallback), previous, newly
-        )
+        return self.summarizer.summarize(entries, fallback)
 
     async def compact_async(
         self, newly: list[Entry], previous: SummaryEntry | None, covered: list[Entry]
-    ) -> SummaryUpdate:
+    ) -> LLMResponse:
         """``compact``, with ``summarizer.summarize_async``."""
         entries, fallback = self._inputs(newly, previous, covered)
-        return self._update(
-            await self.summarizer.summarize_async(entries, fallback), previous, newly
-        )
+        return await self.summarizer.summarize_async(entries, fallback)
 
     def _inputs(
         self, newly: list[Entry], previous: SummaryEntry | None, covered: list[Entry]
     ) -> tuple[list[Entry], SummaryEntry | None]:
         """What to summarize: every original, then ``previous`` only if some original is missing."""
         self._require_entries(newly)
-        available = {entry.id_ for entry in covered}
-        missing = previous is not None and any(
-            entry_id not in available for entry_id in previous.covers
-        )
+        missing = previous is not None and len(covered) < previous.covers_count
         return [*covered, *newly], previous if missing else None

@@ -11,6 +11,11 @@ class LastNPolicy(BasePolicy):
     With 1000 entries and ``n=250``, entries 751-1000 are active. Each new
     entry pushes the oldest active one out, so the active history moves
     forward one entry at a time and always holds at most ``n`` entries.
+
+    With a compaction, avoid it: once full, every add drops one entry, so
+    every add is a compaction call (an LLM call) and a new summary that
+    breaks the provider's prompt cache. ``SlidingWindowPolicy`` drops
+    entries in batches, so it summarizes once every ``step`` adds.
     """
 
     def __init__(self, n: int) -> None:

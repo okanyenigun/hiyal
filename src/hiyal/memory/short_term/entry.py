@@ -137,6 +137,12 @@ class SummaryEntry(BaseModel):
     replaces the previous one, and leads ``active``. It is never in the
     window, so policies never drop it, and the entries it covers never
     return to the window.
+
+    What it covers is kept short, so it does not grow with the history:
+    every entry stored up to ``covers_through``, except ``covers_except``
+    (the few that were never summarized: pinned, filtered, system prompts).
+    Summaries and notes are never covered, so they are not listed there.
+    ``covered()`` turns that back into the IDs.
     """
 
     id_: str = Field(
@@ -145,10 +151,40 @@ class SummaryEntry(BaseModel):
         description="Entry ID, generated automatically. Never empty.",
     )
     text: str = Field(min_length=1, description="The summary.")
-    covers: list[str] = Field(
+    covers_through: str = Field(
         min_length=1,
-        description="IDs of the entries this summary stands in for, oldest first.",
+        description="ID of the newest entry this summary covers.",
     )
+    covers_except: list[str] = Field(
+        default_factory=list,
+        description=(
+            "IDs of the entries stored before covers_through that it does not "
+            "cover, oldest first; summaries and notes are not listed."
+        ),
+    )
+    covers_count: int = Field(
+        ge=1,
+        description=(
+            "How many entries it covers. covered() finding fewer means some "
+            "were removed from the storage."
+        ),
+    )
+
+    def covered(self, originals: list[str]) -> list[str]:
+        """The IDs this summary covers, out of ``originals``.
+
+        ``originals`` are the IDs of the session's entries in history order,
+        summaries and notes left out. Returns those up to ``covers_through``,
+        except ``covers_except``; none if ``covers_through`` is not among
+        them (removed from the storage), since where the summary ends can no
+        longer be told.
+        """
+        try:
+            end = originals.index(self.covers_through) + 1
+        except ValueError:
+            return []
+        skipped = set(self.covers_except)
+        return [entry_id for entry_id in originals[:end] if entry_id not in skipped]
 
     def to_text(self) -> str:
         """The summary as plain text for a model to read."""

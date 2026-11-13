@@ -96,9 +96,10 @@ def tokens(entries):
 def check_invariants(manager, where):
     added = [e for e in manager.entries if not isinstance(e, (SummaryEntry, WorkingNotesEntry))]
     window = [e.id_ for e in manager.window]
-    covers = manager.summary.covers if manager.summary else []
+    covers = manager.summary.covered([e.id_ for e in added]) if manager.summary else []
     covered = set(covers)
-    assert len(covers) == len(covered), f"{where}: the summary covers an entry twice"
+    if manager.summary:
+        assert len(covers) == manager.summary.covers_count, f"{where}: covers_count is off"
     assert not covered & set(window), f"{where}: an entry is both in the window and in the summary"
 
     leading = [e.id_ for e in (manager.summary, ) if e] + ([e.id_ for e in manager.active[:2]
@@ -115,6 +116,9 @@ def check_invariants(manager, where):
     replaced = set(systems[:-1])
     lost = [e.text for e in added if e.id_ not in set(window) | covered | excluded | replaced]
     assert not lost, f"{where}: neither in the window, the summary, nor excluded by a filter: {lost}"
+    if manager.summary:
+        assert set(manager.summary.covers_except) <= set(window) | excluded | replaced, \
+            f"{where}: covers_except lists an entry that is neither in the window, excluded, nor replaced"
 
 
 def storage_copy(manager):

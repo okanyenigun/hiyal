@@ -31,7 +31,7 @@ def every_entry():
         ContextEntry(data={"budget": 3000}, source="long_term_memory"),
         ToolResultEntry(message_id="item_1", call_id="call_1", name="get_weather", arguments={"city": "Kyoto"},
                         output={"c": 21}),
-        SummaryEntry(text="Trip to Japan.", covers=["a"]),
+        SummaryEntry(text="Trip to Japan.", covers_through="a", covers_count=1),
         WorkingNotesEntry(notes={"objective": "Compare", "decisions": ["Exclude large-scale"]}),
     ]
 
@@ -172,7 +172,7 @@ class TestFormats:
     @pytest.mark.parametrize("name", ["history.txt", "history.md"])
     def test_readable_formats_show_each_entrys_text(self, tmp_path, name):
         storage = FileStorage(tmp_path / name)
-        storage.add(S, SummaryEntry(text="Trip to Japan in April.", covers=["a"]))
+        storage.add(S, SummaryEntry(text="Trip to Japan in April.", covers_through="a", covers_count=1))
         content = (tmp_path / name).read_text(encoding="utf-8")
         assert "Summary of the earlier conversation:" in content and "Trip to Japan in April." in content
 

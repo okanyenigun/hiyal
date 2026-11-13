@@ -77,6 +77,14 @@ def texts(entries):
     return [entry.text for entry in entries]
 
 
+def covered(manager):
+    """The IDs the current summary covers, read against the session's history."""
+    if manager.summary is None:
+        return []
+    originals = [e.id_ for e in manager.entries if not isinstance(e, (SummaryEntry, WorkingNotesEntry))]
+    return manager.summary.covered(originals)
+
+
 def managed(entries, **settings):
     manager = ShortTermMemoryManager(InMemoryStorage(), **settings)
     for entry in entries:
@@ -416,7 +424,7 @@ class TestCompaction:
     def test_the_summary_covers_everything_that_left(self):
         manager = compacting(notes("a", "b", "c", "d"), policy=LastNPolicy(2))
         by_text = {entry.text: entry.id_ for entry in manager.entries if isinstance(entry, ContextEntry)}
-        assert manager.summary.covers == [by_text["a"], by_text["b"]]
+        assert covered(manager) == [by_text["a"], by_text["b"]]
 
     def test_a_sliding_window_gives_one_summary_per_jump(self):
         summarizer = FakeSummarizer()
@@ -431,10 +439,31 @@ class TestCompaction:
             manager.add(entry)
             added = [e for e in manager.entries if not isinstance(e, SummaryEntry)]
             excluded = {e.id_ for e in added} - {e.id_ for e in filters_keep(policy, added)}
-            covered = set(manager.summary.covers) if manager.summary else set()
+            summarized = set(covered(manager))
             window = {e.id_ for e in manager.active if not isinstance(e, SummaryEntry)}
-            assert window | covered | excluded == {e.id_ for e in added}
-            assert not window & covered and not window & excluded and not covered & excluded
+            assert window | summarized | excluded == {e.id_ for e in added}
+            assert not window & summarized and not window & excluded and not summarized & excluded
+
+    def test_the_summary_lists_only_what_it_skips_however_long_the_history(self):
+        manager = compacting([SystemPrompt(text="S"), *notes(*map(str, range(100)))], policy=SlidingWindowPolicy(10, 5))
+        system = manager.entries[0]
+        assert manager.summary.covers_except == [system.id_]  # the system prompt, still in the window
+        assert manager.summary.covers_count == len(covered(manager)) > 80
+
+    def test_a_pinned_entry_is_an_exception_until_it_leaves(self):
+        manager = compacting(notes("a", "b"), policy=LastNPolicy(1))
+        b = manager.entries[1]
+        manager.pin(b.id_)
+        for entry in notes("c", "d"):
+            manager.add(entry)
+        by_id = {entry.id_: entry for entry in manager.entries}
+        assert manager.summary.covers_except == [b.id_]
+        assert texts(by_id[i] for i in covered(manager)) == ["a", "c"]
+        manager.unpin(b.id_)
+        manager.add(ContextEntry(text="e"))
+        by_id = {entry.id_: entry for entry in manager.entries}
+        assert manager.summary.covers_except == []
+        assert texts(by_id[i] for i in covered(manager)) == ["a", "b", "c", "d"]
 
     def test_without_a_compaction_what_leaves_is_forgotten(self):
         manager = managed(notes("a", "b", "c"), policy=LastNPolicy(2))
@@ -517,7 +546,7 @@ class TestCompaction:
     def test_refused(self):
         manager = compacting(notes("a", "b"), policy=LastNPolicy(1))
         with pytest.raises(ValueError, match="summaries come from compaction"):
-            manager.add(SummaryEntry(text="s", covers=["x"]))
+            manager.add(SummaryEntry(text="s", covers_through="x", covers_count=1))
         with pytest.raises(ValueError, match="pinned by rule"):
             manager.pin(manager.summary.id_)
         with pytest.raises(ValueError, match="stay pinned"):
@@ -547,7 +576,7 @@ class TestCompactOnDemand:
         manager = compacting(notes("a", "b", "c", "d"), summarizer)
         a, b, c, d = manager.entries
         manager.compact(max_tokens=size(c, d))
-        assert summarizer.calls == [(["a", "b"], None)] and manager.summary.covers == [a.id_, b.id_]
+        assert summarizer.calls == [(["a", "b"], None)] and covered(manager) == [a.id_, b.id_]
         assert texts(manager.window) == ["c", "d"]
 
     def test_it_stops_at_the_first_entry_that_does_not_fit(self):
@@ -815,4 +844,4 @@ class TestAsyncConcurrency:
             await asyncio.gather(manager.compact_async(), manager.add_async(ContextEntry(text="c")))
 
         asyncio.run(session())
-        assert texts(manager.window) == ["c"] and manager.summary.covers == [e.id_ for e in manager.entries[:2]]
+        assert texts(manager.window) == ["c"] and covered(manager) == [e.id_ for e in manager.entries[:2]]
