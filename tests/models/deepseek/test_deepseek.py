@@ -147,7 +147,7 @@ class TestToolCallResponses:
         result = llm.query(user_prompt="Weather?")
         assert result.has_tool_calls
         [call] = result.tool_calls
-        assert (call.name, call.arguments, call.status, call.raw.id) == ("get_weather", {"city": "Paris"}, "complete", "c1")
+        assert (call.name, call.arguments, call.status, call.raw["id"]) == ("get_weather", {"city": "Paris"}, "complete", "c1")
         assert result.messages[-1].finish_reason == "tool_call"
 
     def test_streamed_calls_are_typed_and_fragments_are_deltas(self):

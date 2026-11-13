@@ -3,7 +3,31 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from hiyal.utility import Dicts, Identifiers, Parsing, Timing
+from hiyal.utility import Checks, Dicts, Identifiers, Parsing, Timing, Tokens
+from hiyal.utility import tokens as tokens_module
+
+
+class TestChecks:
+    def test_a_non_empty_string_passes_through(self):
+        assert Checks.non_empty_string("abc", "session_id") == "abc"
+
+    def test_anything_else_than_a_string_is_a_type_error_naming_the_argument(self):
+        with pytest.raises(TypeError, match="entry_id must be a string, got int"):
+            Checks.non_empty_string(7, "entry_id")
+
+    def test_an_empty_string_is_a_value_error_naming_the_argument(self):
+        with pytest.raises(ValueError, match="session_id must not be empty"):
+            Checks.non_empty_string("", "session_id")
+
+
+class TestPositiveInt:
+    def test_a_positive_integer_passes_through(self):
+        assert Checks.positive_int(3, "n") == 3
+
+    @pytest.mark.parametrize("value", [0, -1, 1.5, True, "3", None])
+    def test_anything_else_is_a_value_error_naming_the_argument(self, value):
+        with pytest.raises(ValueError, match="n must be a positive integer"):
+            Checks.positive_int(value, "n")
 
 
 class TestDicts:
@@ -63,6 +87,10 @@ class TestIdentifiers:
 
 
 class TestParsing:
+    @pytest.mark.parametrize("text", ['{"a": 1}', '  {"a": 1}\n', '```json\n{"a": 1}\n```', '```\n{"a": 1}\n```'])
+    def test_unfenced_strips_a_surrounding_code_fence(self, text):
+        assert Parsing.unfenced(text) == '{"a": 1}'
+
     @pytest.mark.parametrize("text, expected", [
         ('{"a": 1}', {"a": 1}),
         ("[1, 2]", [1, 2]),
@@ -104,3 +132,45 @@ class TestTiming:
     @pytest.mark.parametrize("value", [None, "", "yesterday", "2026-13-01T00:00:00Z"])
     def test_empty_or_invalid_timestamps_give_none(self, value):
         assert Timing.parse_datetime(value) is None
+
+
+class TestTokens:
+    @pytest.mark.parametrize("tokens, words", [(4, 3), (100, 75), (1, 1), (0, 1)])
+    def test_to_words_is_about_three_words_per_four_tokens_and_at_least_one(self, tokens, words):
+        assert Tokens.to_words(tokens) == words
+
+    @pytest.fixture
+    def fake_tiktoken(self, monkeypatch):
+        """A tiktoken whose encodings split on spaces, so no encoding file is downloaded."""
+        loaded = []
+
+        class Encoding:
+            def encode(self, text):
+                return text.split()
+
+        def get_encoding(name):
+            loaded.append(name)
+            return Encoding()
+
+        tokens_module._load.cache_clear()
+        monkeypatch.setattr(tokens_module.tiktoken, "get_encoding", get_encoding)
+        yield loaded
+        tokens_module._load.cache_clear()
+
+    def test_counts_with_the_default_encoding(self, fake_tiktoken):
+        assert Tokens.count("one two three") == 3
+        assert fake_tiktoken == ["o200k_base"]
+
+    def test_loads_each_encoding_once(self, fake_tiktoken):
+        Tokens.count("a b")
+        Tokens.count("c d e")
+        Tokens.count("f", "cl100k_base")
+        assert fake_tiktoken == ["o200k_base", "cl100k_base"]
+
+    def test_an_unknown_encoding_is_refused_before_loading(self, fake_tiktoken):
+        with pytest.raises(ValueError, match="unknown encoding 'gpt-9'; use one of .*o200k_base"):
+            Tokens.count("text", "gpt-9")
+        assert fake_tiktoken == []
+
+    def test_require_encoding_returns_a_known_name(self):
+        assert Tokens.require_encoding("cl100k_base") == "cl100k_base"

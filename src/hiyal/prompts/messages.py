@@ -1,15 +1,25 @@
 from typing import Any
+from uuid import uuid4
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 from .media import Audio, Document, Image, Media
 
 
 class Prompt(BaseModel):
+    id_: str = Field(
+        default_factory=lambda: str(uuid4()),
+        min_length=1,
+        description="Prompt ID, generated automatically. Never empty.",
+    )
     text: str = Field(description="Text")
     kind: str = Field(default="base", description="type of prompt")
 
 
 class SystemPrompt(Prompt):
     kind: str = Field(default="system", description="type of prompt")
+
+    def to_text(self) -> str:
+        """The prompt as plain text for a model to read: ``System: ...``."""
+        return f"System: {self.text}"
 
 
 class UserPrompt(Prompt):
@@ -48,3 +58,8 @@ class UserPrompt(Prompt):
     @property
     def has_media(self) -> bool:
         return bool(self.images or self.audio or self.documents)
+
+    def to_text(self) -> str:
+        """The prompt as plain text for a model to read: ``User: ...``, with media as placeholders."""
+        media = [item.placeholder() for item in [*self.images, *self.audio, *self.documents]]
+        return "\n".join([f"User: {self.text}", *media])

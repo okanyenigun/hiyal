@@ -365,7 +365,7 @@ class AnthropicStreamAccumulator(StreamAccumulator[AnthropicTranslator]):
         for index in self.tool_blocks:
             self._finish_tool(index)
         response = self.translator.build_response(
-            message_id=self.response_id or "",
+            message_id=self.response_id or Identifiers.generate_id("anthropic"),
             model=self.model or "",
             contents=[self.contents[index] for index in sorted(self.contents)],
             content_ids=[self.block_ids[index] for index in sorted(self.contents)],

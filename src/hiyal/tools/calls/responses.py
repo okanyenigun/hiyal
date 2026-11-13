@@ -7,9 +7,11 @@ from pydantic import (
     JsonValue,
     TypeAdapter,
     ValidationError,
+    field_validator,
     model_validator,
 )
 from typing import Any, Literal, Self
+from ...utility import Raw
 
 # Decodes a JSON object whose values are JSON, rejecting NaN and non-object input.
 _ARGUMENTS = TypeAdapter(
@@ -96,16 +98,24 @@ class ToolCall(BaseModel):
             {"code": "missing_arguments", "message": "No arguments were returned."}
         ],
     )
-    raw: Any = Field(
+    raw: dict[str, Any] | None = Field(
+        default=None,
         exclude=True,
         repr=False,
         description=(
-            "Original provider tool-call item or enclosing part, preserved unchanged. "
-            "Provider correlation IDs and other native metadata can be read from "
-            "this object. Excluded from serialization; tracking belongs to the "
+            "The provider's original tool-call item or enclosing part as a "
+            "JSON-compatible dict, converted from the SDK object with "
+            "model_dump(mode='json'). Provider correlation IDs and other native "
+            "metadata can be read from it. Excluded from serialization, so None "
+            "when the call is loaded back from JSON; tracking belongs to the "
             "containing ResponseMessage.id."
         ),
     )
+
+    @field_validator("raw", mode="before")
+    @classmethod
+    def _raw_as_dict(cls, value: Any) -> dict[str, Any] | None:
+        return Raw.to_dict(value)
 
     @model_validator(mode="after")
     def validate_call_state(self) -> Self:

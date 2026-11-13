@@ -185,7 +185,12 @@ class TestParsing:
     def test_missing_metadata_falls_back(self, llm):
         requested = datetime(2025, 5, 5, tzinfo=timezone.utc)
         result = parse(llm, chunk(candidate(text("x"), reason="STOP")), model="requested", created_at=requested)
-        assert (result.id_, result.model, result.created_at, result.usage) == ("", "requested", requested, None)
+        assert (result.model, result.created_at, result.usage) == ("requested", requested, None)
+
+    def test_missing_response_id_gets_a_generated_unique_id(self, llm):
+        first, second = (parse(llm, chunk(candidate(text("x"), reason="STOP"))) for _ in range(2))
+        assert first.id_.startswith("gemini_") and second.id_.startswith("gemini_")
+        assert first.id_ != second.id_
 
     def test_only_the_first_candidate_is_used(self, llm):
         result = parse(llm, chunk(candidate(text("main"), reason="STOP"), candidate(text("alt"), index=1, reason="STOP")))
@@ -206,7 +211,8 @@ class TestParsing:
         first, second = function_call(args={"city": "Istanbul"}), function_call(args={"city": "Paris"})
         result = parse(llm, chunk(candidate(first, second, reason="STOP")))
         assert [c.arguments["city"] for c in result.tool_calls] == ["Istanbul", "Paris"]
-        assert result.tool_calls[0].raw is first and result.messages[0].finish_reason == "tool_call"
+        assert result.tool_calls[0].raw == first.model_dump(mode="json")
+        assert result.messages[0].finish_reason == "tool_call"
 
     def test_missing_arguments_do_not_become_an_empty_object(self, llm):
         call = parse(llm, chunk(candidate(function_call(args=None), reason="STOP"))).tool_calls[0]
@@ -246,6 +252,10 @@ def stream(llm, chunks):
 
 
 class TestStreaming:
+    def test_missing_response_id_gets_a_generated_id(self, llm):
+        *_, terminal = stream(llm, [chunk(candidate(text("x"), reason="STOP"))])
+        assert terminal.response.id_.startswith("gemini_")
+
     def test_text_accumulates_and_latest_usage_wins(self, llm):
         events = stream(llm, [chunk(candidate(text("Hel")), usage=usage(output=1, total=4), response_id="g1"),
                               chunk(candidate(text("lo."), reason="STOP"), usage=usage(output=2, total=5))])
@@ -291,7 +301,8 @@ class TestStreaming:
         events = stream(llm, [chunk(candidate(first)), chunk(candidate(last, reason="STOP"))])
         result = events[-1].response
         assert len(result.tool_calls) == 1 and result.tool_calls[0].arguments == {"city": "Paris"}
-        assert result.tool_calls[0].raw is first and events[0].message_id == events[1].message_id
+        assert result.tool_calls[0].raw == first.model_dump(mode="json")
+        assert events[0].message_id == events[1].message_id
 
     def test_incremental_calls_without_ids_continue_the_pending_call(self, llm):
         events = stream(llm, [chunk(candidate(function_call(args={}, will_continue=True))),

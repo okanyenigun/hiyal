@@ -2,7 +2,7 @@ import json
 import unittest
 from types import SimpleNamespace
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from hiyal.tools import ToolCall, ToolCallIssue
 
@@ -14,7 +14,7 @@ class ToolCallTests(unittest.TestCase):
             "options": {"enabled": True, "limit": 0, "ratio": 1.5, "missing": None},
             "days": ["Monday", "Tuesday"],
         }
-        raw = SimpleNamespace(id="fc_item", call_id="call_provider")
+        raw = {"id": "fc_item", "call_id": "call_provider"}
         call = ToolCall(
             raw=raw, name="get_weather",
             arguments=arguments, status="complete",
@@ -27,25 +27,45 @@ class ToolCallTests(unittest.TestCase):
         restored = ToolCall.model_validate({**serialized, "raw": raw})
         self.assertEqual(restored, call)
         self.assertEqual(restored.arguments, arguments)
-        self.assertIs(call.raw, raw)
-        self.assertIs(restored.raw, raw)
+        self.assertEqual(call.raw, raw)
+        self.assertEqual(restored.raw, raw)
 
-    def test_provider_call_parts_are_retained_unchanged(self):
-        raw_parts = [
-            SimpleNamespace(id="fc_item", call_id="call_provider"),
-            SimpleNamespace(id="toolu_provider"),
-            SimpleNamespace(function_call=SimpleNamespace(id="gemini_provider")),
-            {"function": {"name": "get_weather", "arguments": {}}},
-        ]
-        for raw in raw_parts:
+    def test_provider_sdk_objects_become_json_dicts(self):
+        class SdkCall(BaseModel):
+            id: str
+            signature: bytes
+
+        call = ToolCall(raw=SdkCall(id="fc_item", signature=b"\x00\xff"), name="get_weather",
+                        arguments={}, status="complete")
+        self.assertEqual(call.raw, {"id": "fc_item", "signature": "AP8="})  # bytes as base64 text
+
+    def test_sdk_objects_with_dates_become_json_dicts(self):
+        from datetime import datetime, timezone
+
+        class SdkEvent(BaseModel):
+            at: datetime
+
+        call = ToolCall(raw=SdkEvent(at=datetime(2026, 1, 1, tzinfo=timezone.utc)), name="f",
+                        arguments={}, status="complete")
+        self.assertEqual(call.raw, {"at": "2026-01-01T00:00:00Z"})
+        self.assertNotIn("raw", call.model_dump())
+
+    def test_dicts_and_none_are_kept(self):
+        for raw in ({"function": {"name": "get_weather", "arguments": {}}}, None):
             with self.subTest(raw=raw):
                 call = ToolCall(raw=raw, name="get_weather", arguments={}, status="complete")
-                self.assertIs(call.raw, raw)
-                self.assertNotIn("raw", call.model_dump())
+                self.assertEqual(call.raw, raw)
 
-    def test_raw_is_required_but_not_serialized(self):
-        with self.assertRaises(ValidationError):
-            ToolCall(name="get_weather", arguments={}, status="complete")
+    def test_other_objects_are_refused(self):
+        for raw in (SimpleNamespace(id="x"), "text", object()):
+            with self.subTest(raw=raw), self.assertRaises(TypeError):
+                ToolCall(raw=raw, name="get_weather", arguments={}, status="complete")
+
+    def test_raw_is_optional_so_a_serialized_call_can_be_reloaded(self):
+        original = ToolCall(raw={"sdk": "object"}, name="get_weather", arguments={"city": "Kyoto"}, status="complete")
+        reloaded = ToolCall.model_validate_json(original.model_dump_json())
+        self.assertIsNone(reloaded.raw)
+        self.assertEqual(reloaded.model_dump(), original.model_dump())
 
     def test_explicit_empty_arguments_are_valid_but_missing_arguments_are_not(self):
         call = ToolCall(raw=None, name="get_time", arguments={}, status="complete")

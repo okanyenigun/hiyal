@@ -67,7 +67,9 @@ class TestBuildRequest:
 
     def test_fields_are_renamed_and_none_values_dropped(self, translator):
         params = self.build(translator, system_prompt="sys", max_output_tokens=9, temperature=None)
-        assert params["instructions"] == {"text": "sys", "kind": "system"}
+        instructions = dict(params["instructions"])
+        assert isinstance(instructions.pop("id_"), str)
+        assert instructions == {"text": "sys", "kind": "system"}
         assert params["max_tokens"] == 9 and "temperature" not in params and "max_output_tokens" not in params
 
     def test_connection_client_and_tool_fields_are_never_sent(self, translator):

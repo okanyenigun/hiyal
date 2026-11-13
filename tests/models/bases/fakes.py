@@ -13,7 +13,7 @@ class FakeClient:
     """Records calls; ``with_options`` returns a derived client, like the real SDKs."""
 
     def __init__(self, log: list, options: dict | None = None, asynchronous: bool = False,
-                 result: Any = "raw-response", stream_items: tuple = ("a", "b")) -> None:
+                 result: Any = "raw-response", stream_items: tuple = ({"text": "a"}, {"text": "b"})) -> None:
         self.log, self.options, self.asynchronous = log, options or {}, asynchronous
         self.result, self.stream_items = result, stream_items
 
@@ -46,7 +46,7 @@ class FakeTransport(WithOptionsTransport):
 
 class FakeAccumulator(StreamAccumulator["FakeTranslator"]):
     def _adapt(self, event: Any) -> list:
-        return [self._delta(message_index=0, message_id="m0", content=ResponseContent(content_type="text", text=event))]
+        return [self._delta(message_index=0, message_id="m0", content=ResponseContent(content_type="text", text=event["text"]))]
 
 
 class FakeTranslator(Translator):

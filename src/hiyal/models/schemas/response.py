@@ -1,11 +1,13 @@
 import base64
-from pydantic import BaseModel, ConfigDict, Field
+import json
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from datetime import datetime
 from typing import Any, Literal, TypeVar
 from .usage import ResponseTiming, TokenUsage
 from .types import FinishReason, MessageRole, Provider, ResponseStatus
 from ...prompts.media import Audio, Image, Media
 from ...tools.calls.responses import ToolCall, ToolCallDelta
+from ...utility import Raw
 
 
 MediaT = TypeVar("MediaT", bound=Media)
@@ -30,6 +32,10 @@ class ResponseError(BaseModel):
 
 
 class ResponseContent(BaseModel):
+    # Image and audio output keep raw bytes in ``data``; in JSON they are
+    # written as base64 so a response can be stored and reloaded.
+    model_config = ConfigDict(ser_json_bytes="base64")
+
     content_type: Literal[
         "text",
         "reasoning",
@@ -107,9 +113,24 @@ class ResponseMessage(BaseModel):
         examples=["stop"],
     )
 
+    @field_validator("content", mode="before")
+    @classmethod
+    def _rebuild_tool_calls(cls, value: Any) -> Any:
+        """Rebuild tool-call content loaded as plain data as ``ToolCallContent``.
+
+        ``content`` is declared as the general ``ResponseContent``, whose
+        ``data`` accepts anything, so a tool call read from JSON would stay a
+        dict and ``LLMResponse.tool_calls`` would miss it.
+        """
+        if isinstance(value, dict) and value.get("content_type") == "tool_call":
+            return ToolCallContent.model_validate(value)
+        return value
+
 
 class LLMResponse(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    # ser_json_bytes: image and audio output bytes in message content are
+    # written as base64 in JSON; untyped bytes follow the outermost model.
+    model_config = ConfigDict(arbitrary_types_allowed=True, ser_json_bytes="base64")
     text: str = Field(
         description="Normalized text output from the model.",
         examples=["Hello, world!"],
@@ -118,7 +139,11 @@ class LLMResponse(BaseModel):
         description="Normalized response items in provider order."
     )
     provider: Provider = Field(description="Provider name.", examples=["openai"])
-    id_: str = Field(description="Response ID.", examples=["resp-123"])
+    id_: str = Field(
+        min_length=1,
+        description="Response ID; the provider's, or generated when it gives none. Never empty.",
+        examples=["resp-123"],
+    )
     model: str = Field(description="Model ID.", examples=["gpt-5.5"])
     created_at: datetime = Field(
         description="Response creation timestamp.", examples=["2024-01-01T12:00:00Z"]
@@ -138,11 +163,21 @@ class LLMResponse(BaseModel):
         default=None,
         description="Error details when status is 'failed'.",
     )
-    raw: Any = Field(
+    raw: dict[str, Any] | None = Field(
+        default=None,
         exclude=True,
         repr=False,
-        description="Original SDK response object; excluded from serialization.",
+        description=(
+            "The provider's original response as a JSON-compatible dict, converted "
+            "from the SDK object with model_dump(mode='json'). Excluded from "
+            "serialization, so None when the response is loaded back from JSON."
+        ),
     )
+
+    @field_validator("raw", mode="before")
+    @classmethod
+    def _raw_as_dict(cls, value: Any) -> dict[str, Any] | None:
+        return Raw.to_dict(value)
 
     @property
     def images(self) -> list[Image]:
@@ -166,7 +201,9 @@ class LLMResponse(BaseModel):
                 # Adapters store {"mime_type", "data" (bytes or base64) | "uri"}.
                 data = content.data.get("data")
                 if isinstance(data, str):
-                    data = base64.b64decode(data)
+                    # Standard or URL-safe base64; a reloaded response holds
+                    # the URL-safe form Pydantic writes for bytes.
+                    data = base64.b64decode(data.replace("-", "+").replace("_", "/"))
                 item = media_class(
                     mime_type=content.data["mime_type"],
                     data=data,
@@ -206,3 +243,17 @@ class LLMResponse(BaseModel):
     def has_tool_calls(self) -> bool:
         """Whether this response contains normalized application-function calls."""
         return bool(self.tool_calls)
+
+    def to_text(self) -> str:
+        """The response as plain text for a model to read, e.g. in a summary prompt.
+
+        The visible text, then each tool call with its arguments, then a
+        placeholder for each image or audio output. Reasoning is left out:
+        it is the model's scratch work, not part of the conversation.
+        """
+        lines = [f"Assistant: {self.text}"] if self.text else []
+        for call in self.tool_calls:
+            arguments = json.dumps(call.arguments, ensure_ascii=False) if call.arguments is not None else ""
+            lines.append(f"Tool call: {call.name or '(unnamed)'}({arguments})")
+        lines += [media.placeholder() for media in [*self.images, *self.audio]]
+        return "\n".join(lines) or "Assistant: (no output)"

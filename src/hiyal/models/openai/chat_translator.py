@@ -18,6 +18,7 @@ from ..schemas import (
     TokenUsage,
 )
 from ...prompts.messages import UserPrompt
+from ...utility import Identifiers
 
 
 class ChatCompletionsTranslator(Translator):
@@ -202,7 +203,7 @@ class ChatStreamAccumulator(StreamAccumulator[ChatCompletionsTranslator]):
         if self.raw is None:
             return ()
         response = self.translator.build_chat_response(
-            response_id=self.response_id or "",
+            response_id=self.response_id or Identifiers.generate_id("chat"),
             model=self.model or "",
             created=self.created,
             contents=self.contents,

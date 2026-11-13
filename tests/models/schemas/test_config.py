@@ -48,8 +48,15 @@ class TestDefaultsAndValidation:
 
     def test_string_prompts_become_prompt_objects(self):
         config = LLMConfig(system_prompt="Be brief.", user_prompt="Hi")
-        assert config.system_prompt == SystemPrompt(text="Be brief.")
-        assert config.user_prompt == UserPrompt(text="Hi")
+        # Each prompt gets its own generated id_, so compare everything else.
+        assert isinstance(config.system_prompt, SystemPrompt)
+        assert isinstance(config.user_prompt, UserPrompt)
+        assert config.system_prompt.model_dump(exclude={"id_"}) == SystemPrompt(
+            text="Be brief."
+        ).model_dump(exclude={"id_"})
+        assert config.user_prompt.model_dump(exclude={"id_"}) == UserPrompt(
+            text="Hi"
+        ).model_dump(exclude={"id_"})
 
     def test_prompt_objects_are_kept(self):
         prompt = UserPrompt(text="Hi")

@@ -25,6 +25,7 @@ dependencies = [
     "openai>=3.22.1",
     "pydantic>=2.12",
     "python-dotenv>=1.2.3",
+    "tiktoken>=0.14.0",
 ]
 
 [project.urls]

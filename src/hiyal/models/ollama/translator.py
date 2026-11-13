@@ -375,7 +375,7 @@ class OllamaStreamAccumulator(StreamAccumulator[OllamaTranslator]):
         # response builder marks it incomplete.
         response = self.translator.build_response(
             response=self.raw,
-            response_id=self.response_id or "",
+            response_id=self.response_id or Identifiers.generate_id("ollama"),
             contents=self.contents,
             model=self.model,
             created_at=self.created_at,
