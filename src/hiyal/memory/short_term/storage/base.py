@@ -2,7 +2,7 @@
 
 import asyncio
 from abc import ABC, abstractmethod
-from ..entry import Entry
+from ..entry import Entry, entry_type_name
 
 
 class BaseStorage(ABC):
@@ -43,6 +43,16 @@ class BaseStorage(ABC):
         A session nothing was added to has no entries.
         """
 
+    def index(self, session_id: str) -> list[tuple[str, str]]:
+        """The session's ``(id, type name)`` pairs, oldest first: what is stored, without the entries.
+
+        Lets a reader find what it needs before fetching it with ``get``.
+        By default it is made from ``entries()``; a storage that can read
+        less overrides it (SQLite reads two columns; a file skips
+        rebuilding the entries).
+        """
+        return [(entry.id_, entry_type_name(entry)) for entry in self.entries(session_id)]
+
     @abstractmethod
     def get(self, session_id: str, entry_ids: list[str]) -> list[Entry]:
         """The session's entries with these IDs, in the order of ``entry_ids``.
@@ -68,6 +78,10 @@ class BaseStorage(ABC):
     async def entries_async(self, session_id: str) -> list[Entry]:
         """``entries``, in a worker thread."""
         return await asyncio.to_thread(self.entries, session_id)
+
+    async def index_async(self, session_id: str) -> list[tuple[str, str]]:
+        """``index``, in a worker thread."""
+        return await asyncio.to_thread(self.index, session_id)
 
     async def get_async(self, session_id: str, entry_ids: list[str]) -> list[Entry]:
         """``get``, in a worker thread."""

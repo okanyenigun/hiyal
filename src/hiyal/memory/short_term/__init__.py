@@ -1,7 +1,14 @@
-from .compaction import BaseCompaction, RebuildCompaction, RollingCompaction
+from .compaction import (
+    BaseCompaction,
+    HybridCompaction,
+    RebuildCompaction,
+    RollingCompaction,
+)
 from .entry import (
+    MEDIA_TOKENS,
     ContextEntry,
     Entry,
+    RewindEntry,
     SummaryEntry,
     ToolResultEntry,
     WorkingNotesEntry,
@@ -12,8 +19,11 @@ from .policies import (
     BasePolicy,
     ChainPolicy,
     FullPolicy,
+    HeadTailPolicy,
     LastNPolicy,
+    PredicateFilterPolicy,
     SlidingWindowPolicy,
+    TokenWindowPolicy,
     TypeFilterPolicy,
 )
 from .storage import BaseStorage, FileStorage, InMemoryStorage, SQLiteStorage
@@ -33,11 +43,16 @@ __all__ = [
     "Entry",
     "FileStorage",
     "FullPolicy",
+    "HeadTailPolicy",
+    "HybridCompaction",
     "InMemoryStorage",
     "LastNPolicy",
+    "MEDIA_TOKENS",
     "NoteTaker",
     "NotesUpdate",
+    "PredicateFilterPolicy",
     "RebuildCompaction",
+    "RewindEntry",
     "RollingCompaction",
     "ShortTermMemoryManager",
     "SlidingWindowPolicy",
@@ -45,6 +60,7 @@ __all__ = [
     "Summarizer",
     "SummaryEntry",
     "SummaryUpdate",
+    "TokenWindowPolicy",
     "ToolResultEntry",
     "TypeFilterPolicy",
     "WorkingNotesEntry",

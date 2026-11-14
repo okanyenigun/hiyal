@@ -12,6 +12,7 @@ entry's class name, since the JSON alone does not say which class it was:
 
 import json
 from abc import ABC, abstractmethod
+from typing import Any
 from ..entry import Entry, build_entry, entry_type_name
 
 
@@ -33,6 +34,10 @@ class FileFormat(ABC):
 
     def records(self, text: str) -> list[tuple[str, Entry]]:
         """Every ``(session_id, entry)`` stored in the file's ``text``, oldest first."""
+        return [(session, build_entry(name, data)) for session, name, data in self.raw(text)]
+
+    def raw(self, text: str) -> list[tuple[str, str, dict[str, Any]]]:
+        """Every ``(session_id, type name, entry JSON)`` in the file's ``text``, oldest first, without rebuilding the entries."""
         return [self._decode(record) for record in self._find(text)]
 
     @staticmethod
@@ -42,10 +47,10 @@ class FileFormat(ABC):
         return f'{{"session":{json.dumps(session_id)},"type":{json.dumps(name)},"entry":{entry.model_dump_json()}}}'
 
     @staticmethod
-    def _decode(record: str) -> tuple[str, Entry]:
-        """The session and the entry, rebuilt from what ``_encode`` produced."""
+    def _decode(record: str) -> tuple[str, str, dict[str, Any]]:
+        """The session, the type name and the entry's JSON, from what ``_encode`` produced."""
         data = json.loads(record)
-        return data["session"], build_entry(data["type"], data["entry"])
+        return data["session"], data["type"], data["entry"]
 
 
 class JsonLinesFormat(FileFormat):

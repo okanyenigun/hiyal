@@ -96,6 +96,16 @@ class SQLiteStorage(BaseStorage):
             ).fetchall()
         return [build_entry(name, json.loads(data)) for name, data in rows]
 
+    def index(self, session_id: str) -> list[tuple[str, str]]:
+        # Two small columns; no entry JSON is read or rebuilt.
+        Checks.non_empty_string(session_id, "session_id")
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT id, type FROM entries WHERE session_id = ? ORDER BY position",
+                (session_id,),
+            ).fetchall()
+        return [(entry_id, name) for entry_id, name in rows]
+
     def get(self, session_id: str, entry_ids: list[str]) -> list[Entry]:
         wanted = [
             Checks.non_empty_string(entry_id, "entry_id") for entry_id in entry_ids

@@ -79,8 +79,14 @@ class Summarizer(BaseSummarizer):
           combining and shortening keep their hub prompts.
         - ``prompt_name``, ``prompt_version``: the hub prompt for
           summarizing entries, when no ``instructions`` are given.
+          ``"memory/summarize"`` covers everything; with a note taker,
+          ``"memory/summarize_with_notes"`` records what happened and
+          leaves the current state to the notes, so the two do not repeat
+          each other.
         - ``combine_version``, ``shorten_version``: the versions of the hub
-          prompts ``memory/combine`` and ``memory/shorten``.
+          prompts ``memory/combine`` and ``memory/shorten``. Match them to
+          the summary's shape: ``v1`` writes prose; ``v2`` keeps the
+          headings of ``memory/summarize`` ``v2``, so use all three together.
         - ``focus``: what the summary is for; can be set again later.
         - ``chunk_tokens``: the most text one call may take; longer input is
           chunked and combined.

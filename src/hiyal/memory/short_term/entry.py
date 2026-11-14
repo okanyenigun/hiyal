@@ -7,11 +7,22 @@ entries before it (a system prompt, context, the user prompt) are its input.
 """
 
 import json
-from typing import Any, Self
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import Any, Literal, Self
 from uuid import uuid4
 from pydantic import BaseModel, Field, JsonValue, model_validator
 from ...models.schemas import LLMResponse
 from ...prompts import Audio, Document, Image, SystemPrompt, UserPrompt
+from ...utility import Tokens
+from ...utility.tokens import DEFAULT_ENCODING
+
+# Tokens counted for each attached image, audio clip and document, which
+# an entry's text shows only as a short placeholder. Rough, fixed estimates
+# (LlamaIndex's); the real cost depends on the model, the size and the pages.
+MEDIA_TOKENS: Mapping[str, int] = MappingProxyType(
+    {"image": 256, "audio": 256, "document": 2048}
+)
 
 
 class ContextEntry(BaseModel):
@@ -169,6 +180,14 @@ class SummaryEntry(BaseModel):
             "were removed from the storage."
         ),
     )
+    version: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "1 for the session's first summary, one more for each that replaces "
+            "the previous; HybridCompaction rebuilds by it."
+        ),
+    )
 
     def covered(self, originals: list[str]) -> list[str]:
         """The IDs this summary covers, out of ``originals``.
@@ -204,6 +223,10 @@ class WorkingNotesEntry(BaseModel):
     one counts: it comes right after the summary in ``active``, and is never
     in the window, so policies never drop it. Unlike the summary, it covers
     no other entries.
+
+    A version comes from the note taker (an LLM update, from the entries
+    since the previous one) or from the app (``set_notes``, one section set
+    directly); ``source`` says which.
     """
 
     id_: str = Field(
@@ -220,6 +243,13 @@ class WorkingNotesEntry(BaseModel):
                 "next_step": None,
             }
         ],
+    )
+    source: Literal["note_taker", "app"] = Field(
+        default="note_taker",
+        description=(
+            "Who wrote this version: the note taker, from the entries since its "
+            "previous update, or the app, setting one section directly."
+        ),
     )
 
     def to_text(self) -> str:
@@ -249,6 +279,31 @@ class WorkingNotesEntry(BaseModel):
         )
 
 
+class RewindEntry(BaseModel):
+    """A marker: the session went back to just after the entry ``to_id``.
+
+    Nothing is removed from the storage; this marker says that what was
+    stored after that entry, from the next entry added on, no longer counts
+    (the summary and notes made right after it still do). Reading the
+    history applies each marker in order (see
+    ``ShortTermMemoryManager.rewind``). It is never in the window, never
+    summarized, and never given to the note taker.
+    """
+
+    id_: str = Field(
+        default_factory=lambda: str(uuid4()),
+        min_length=1,
+        description="Entry ID, generated automatically. Never empty.",
+    )
+    to_id: str = Field(
+        min_length=1, description="ID of the entry the session went back to."
+    )
+
+    def to_text(self) -> str:
+        """The marker as plain text: ``Rewound to entry <to_id>``."""
+        return f"Rewound to entry {self.to_id}"
+
+
 Entry = (
     SystemPrompt
     | UserPrompt
@@ -257,6 +312,7 @@ Entry = (
     | ToolResultEntry
     | SummaryEntry
     | WorkingNotesEntry
+    | RewindEntry
 )
 
 # Every entry class, by its name: what a storage keeps next to an entry's JSON,
@@ -271,6 +327,7 @@ ENTRY_TYPES: dict[str, type[Entry]] = {
         ToolResultEntry,
         SummaryEntry,
         WorkingNotesEntry,
+        RewindEntry,
     )
 }
 
@@ -299,3 +356,43 @@ def finishes_turn(entry: Entry) -> bool:
 def is_derived(entry: Entry) -> bool:
     """Whether ``entry`` was made by a worker (a summary or notes), not added to the conversation."""
     return isinstance(entry, (SummaryEntry, WorkingNotesEntry))
+
+
+def media_count(entry: Entry) -> dict[str, int]:
+    """How many images, audio clips and documents ``entry`` carries, as ``{"image": n, "audio": n, "document": n}``."""
+    if isinstance(entry, (UserPrompt, ContextEntry)):
+        return {
+            "image": len(entry.images),
+            "audio": len(entry.audio),
+            "document": len(entry.documents),
+        }
+    if isinstance(entry, LLMResponse):
+        return {"image": len(entry.images), "audio": len(entry.audio), "document": 0}
+    return {"image": 0, "audio": 0, "document": 0}
+
+
+def check_media_tokens(media_tokens: Mapping[str, int]) -> Mapping[str, int]:
+    """``media_tokens`` when its keys are among ``MEDIA_TOKENS``'s and its values non-negative integers; raises ``ValueError`` otherwise."""
+    unknown = set(media_tokens) - set(MEDIA_TOKENS)
+    if unknown:
+        raise ValueError(
+            f"media_tokens keys must be among {sorted(MEDIA_TOKENS)}, got {sorted(unknown)}"
+        )
+    for kind, tokens in media_tokens.items():
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+            raise ValueError(
+                f"media_tokens[{kind!r}] must be a non-negative integer, got {tokens!r}"
+            )
+    return media_tokens
+
+
+def entry_tokens(
+    entry: Entry,
+    encoding: str = DEFAULT_ENCODING,
+    media_tokens: Mapping[str, int] = MEDIA_TOKENS,
+) -> int:
+    """``entry``'s tokens: its ``to_text()`` counted with ``encoding``, plus the estimate in ``media_tokens`` for each attached medium (a kind left out counts 0)."""
+    media = sum(
+        media_tokens.get(kind, 0) * count for kind, count in media_count(entry).items()
+    )
+    return Tokens.count(entry.to_text(), encoding) + media

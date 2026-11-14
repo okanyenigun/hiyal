@@ -3,9 +3,10 @@
 import os
 import threading
 from pathlib import Path
+from typing import Any
 from .base import BaseStorage
 from .formats import FORMATS, FileFormat
-from ..entry import Entry
+from ..entry import Entry, build_entry
 from ....utility import Checks
 
 
@@ -82,12 +83,29 @@ class FileStorage(BaseStorage):
             records = self._records()
         return [entry for session, entry in records if session == session_id]
 
+    def index(self, session_id: str) -> list[tuple[str, str]]:
+        # The whole file is read, but no entry is rebuilt.
+        Checks.non_empty_string(session_id, "session_id")
+        with self._lock:
+            raw = self._raw()
+        return [(data["id_"], name) for session, name, data in raw if session == session_id]
+
     def get(self, session_id: str, entry_ids: list[str]) -> list[Entry]:
-        # A file has no index: the whole file is read, as for entries().
+        # A file has no index: the whole file is read, but only the wanted
+        # entries are rebuilt.
         wanted = [
             Checks.non_empty_string(entry_id, "entry_id") for entry_id in entry_ids
         ]
-        return self._pick(session_id, wanted, self.entries(session_id))
+        Checks.non_empty_string(session_id, "session_id")
+        keep = set(wanted)
+        with self._lock:
+            raw = self._raw()
+        found = [
+            build_entry(name, data)
+            for session, name, data in raw
+            if session == session_id and data["id_"] in keep
+        ]
+        return self._pick(session_id, wanted, found)
 
     def clear(self, session_id: str) -> None:
         Checks.non_empty_string(session_id, "session_id")
@@ -105,6 +123,12 @@ class FileStorage(BaseStorage):
             return []
         text = self.path.read_text(encoding="utf-8")
         return self.format.records(text)
+
+    def _raw(self) -> list[tuple[str, str, dict[str, Any]]]:
+        """Every record in the file as ``(session_id, type name, entry JSON)``, oldest first, nothing rebuilt."""
+        if not self.path.exists():
+            return []
+        return self.format.raw(self.path.read_text(encoding="utf-8"))
 
     def _write(self, records: list[tuple[str, Entry]]) -> None:
         """Replace the file's content in one step, so a crash cannot leave it half written."""

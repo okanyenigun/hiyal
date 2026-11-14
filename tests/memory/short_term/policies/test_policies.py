@@ -4,13 +4,17 @@ from hiyal.memory.short_term import (
     ChainPolicy,
     ContextEntry,
     FullPolicy,
+    HeadTailPolicy,
     LastNPolicy,
+    PredicateFilterPolicy,
     SlidingWindowPolicy,
     SummaryEntry,
+    TokenWindowPolicy,
     ToolResultEntry,
     TypeFilterPolicy,
 )
-from hiyal.prompts import UserPrompt
+from hiyal.prompts import Image, UserPrompt
+from hiyal.utility import Tokens
 
 
 def numbered(count):
@@ -95,6 +99,105 @@ class TestTypeFilterPolicy:
     def test_exclude_cannot_be_empty(self):
         with pytest.raises(ValueError, match="at least one"):
             TypeFilterPolicy(exclude=[])
+
+
+class TestPredicateFilterPolicy:
+    def test_keeps_what_the_function_says_yes_to_in_order(self):
+        policy = PredicateFilterPolicy(lambda entry: int(entry.text) % 2 == 1)
+        assert texts(policy.select(numbered(6))) == [1, 3, 5]
+
+    def test_is_a_filter(self):
+        policy = PredicateFilterPolicy(lambda entry: int(entry.text) > 2)
+        assert policy.is_filter and texts(policy.filter(numbered(4))) == [3, 4]
+
+    def test_runs_before_a_window_in_a_chain(self):
+        chain = ChainPolicy([LastNPolicy(2), PredicateFilterPolicy(lambda entry: int(entry.text) % 2 == 1)])
+        assert texts(chain.select(numbered(8))) == [5, 7]
+
+    def test_keep_must_be_callable(self):
+        with pytest.raises(TypeError, match="callable"):
+            PredicateFilterPolicy("odd")
+
+
+class TestHeadTailPolicy:
+    def test_keeps_the_head_and_the_tail(self):
+        assert texts(HeadTailPolicy(head=2, tail=3).select(numbered(10))) == [1, 2, 8, 9, 10]
+
+    def test_short_history_is_kept_whole(self):
+        assert texts(HeadTailPolicy(head=2, tail=3).select(numbered(5))) == [1, 2, 3, 4, 5]
+
+    def test_is_a_window(self):
+        policy = HeadTailPolicy(head=1, tail=1)
+        assert not policy.is_filter and texts(policy.filter(numbered(4))) == [1, 2, 3, 4]
+
+    @pytest.mark.parametrize("settings", [{"head": 0, "tail": 2}, {"head": 2, "tail": -1}, {"head": True, "tail": 2}])
+    def test_head_and_tail_must_be_positive_integers(self, settings):
+        with pytest.raises(ValueError, match="positive integer"):
+            HeadTailPolicy(**settings)
+
+
+def sized(*sizes):
+    """Context entries numbered from 1, each ``size`` words long as ``count_words`` counts their text."""
+    return [ContextEntry(text=" ".join([str(number), *["w"] * (size - 2)]))
+            for number, size in enumerate(sizes, 1)]
+
+
+def labels(entries):
+    return [int(entry.text.split()[0]) for entry in entries]
+
+
+class TestTokenWindowPolicy:
+    @pytest.fixture(autouse=True)
+    def count_words(self, monkeypatch):
+        """Count words instead of tokens, so no test loads a tiktoken encoding (that needs network)."""
+        monkeypatch.setattr(Tokens, "count", staticmethod(lambda text, encoding="o200k_base": len(text.split())))
+
+    def test_within_max_tokens_nothing_leaves(self):
+        assert labels(TokenWindowPolicy(12, 6).select(sized(3, 3, 3, 3))) == [1, 2, 3, 4]
+
+    def test_passing_max_tokens_cuts_down_to_target_tokens(self):
+        assert labels(TokenWindowPolicy(12, 6).select(sized(3, 3, 3, 3, 3))) == [4, 5]
+
+    def test_the_start_stays_put_between_cuts(self):
+        policy, entries = TokenWindowPolicy(12, 6), sized(*[3] * 8)
+        assert labels(policy.select(entries[:7])) == [4, 5, 6, 7]  # 12 tokens: no cut yet
+        assert labels(policy.select(entries)) == [7, 8]
+
+    def test_chosen_add_by_add_it_matches_choosing_from_the_whole_history(self):
+        policy = TokenWindowPolicy(12, 5)
+        entries = sized(3, 5, 2, 7, 4, 2, 2, 9, 3, 15, 2, 4, 6, 3, 2, 2, 5)
+        window = []
+        for count, entry in enumerate(entries, 1):
+            window = policy.select([*window, entry])
+            assert window == policy.select(entries[:count])
+
+    def test_the_newest_entry_stays_even_alone_over_max_tokens(self):
+        policy = TokenWindowPolicy(12, 6)
+        assert labels(policy.select(sized(3, 20))) == [2]
+        assert labels(policy.select(sized(3, 20, 3))) == [3]
+
+    def test_the_target_defaults_to_half(self):
+        assert TokenWindowPolicy(100).target_tokens == 50
+
+    def test_attached_media_count_their_estimate(self):
+        photo = UserPrompt(text="1", images=[Image(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")])
+        entries = [photo, *sized(3, 3)[1:]]
+        assert TokenWindowPolicy(100, 10).select(entries) == entries[1:]  # the image's 256 passes 100
+        assert TokenWindowPolicy(100, 10, media_tokens={}).select(entries) == entries  # a few words only
+
+    def test_is_a_window(self):
+        assert not TokenWindowPolicy(10).is_filter
+
+    @pytest.mark.parametrize("settings, message", [
+        ({"max_tokens": 0}, "max_tokens must be a positive integer"),
+        ({"max_tokens": 10, "target_tokens": 0}, "target_tokens must be a positive integer"),
+        ({"max_tokens": 10, "target_tokens": 11}, "cannot be larger than max_tokens"),
+        ({"max_tokens": 10, "encoding": "nope"}, "unknown encoding"),
+        ({"max_tokens": 10, "media_tokens": {"images": 1}}, "media_tokens keys"),
+    ])
+    def test_invalid_settings(self, settings, message):
+        with pytest.raises(ValueError, match=message):
+            TokenWindowPolicy(**settings)
 
 
 class TestChainPolicy:

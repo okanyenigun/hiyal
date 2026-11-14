@@ -29,6 +29,20 @@ class TestPromptHub:
     def test_the_shipped_summarize_prompt_is_there(self):
         assert hub.get("memory/summarize", "v1").startswith("You summarize a conversation")
 
+    @pytest.mark.parametrize("name", ["memory/combine", "memory/shorten"])
+    def test_combine_and_shorten_v2_keep_the_v2_headings(self, name):
+        text = hub.get(name, "v2")
+        assert all(heading in text for heading in ["LANGUAGE", "INTENT", "SUMMARY", "TOOLS", "ARTIFACTS", "NEXT STEPS"])
+        assert 'Write "None"' in text and "plain, compact prose" not in text
+
+    def test_condense_notes_keeps_every_section(self):
+        assert "do not empty a section that has content" in hub.get("memory/condense_notes", "v1")
+
+    def test_summarize_with_notes_leaves_the_current_state_to_the_notes(self):
+        text = hub.get("memory/summarize_with_notes", "v1")
+        assert "Do not restate that state" in text
+        assert Summarizer(llm=None, prompt_name="memory/summarize_with_notes").instructions == text
+
     def test_summarize_v2_asks_for_fixed_headings(self):
         v2 = hub.get("memory/summarize", "v2")
         headings = ["LANGUAGE:", "INTENT:", "SUMMARY:", "TOOLS:", "ARTIFACTS:", "NEXT STEPS:"]

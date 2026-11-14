@@ -280,6 +280,23 @@ class TestChunking:
             Summarizer(llm, chunk_tokens=40).summarize(notes(30, 30))
 
 
+class TestPromptVersions:
+    def test_combine_v2_merges_the_chunk_summaries(self):
+        llm = ScriptedLLM(words(5), words(5), "Combined.")
+        Summarizer(llm, chunk_tokens=40, combine_version="v2").summarize(notes(15, 15, 15))
+        assert systems(llm)[2] == hub.get("memory/combine", "v2")
+
+    def test_shorten_v2_fits_the_budget(self):
+        llm = ScriptedLLM(words(30), words(12))
+        Summarizer(llm, max_tokens=20, shorten_version="v2").summarize(conversation())
+        assert systems(llm)[1].startswith(hub.get("memory/shorten", "v2") + " Aim for about")
+
+    def test_the_summary_for_use_with_notes(self):
+        llm = FakeLLM()
+        Summarizer(llm, prompt_name="memory/summarize_with_notes").summarize(conversation())
+        assert systems(llm) == [hub.get("memory/summarize_with_notes", "v1")]
+
+
 class TestChunkingWithBudget:
     def test_intermediate_calls_take_the_smaller_aim_then_the_result_is_fitted(self):
         llm = ScriptedLLM(words(5), words(5), words(25), words(12))

@@ -1,8 +1,10 @@
 """Every storage serves many sessions at once and keeps them apart."""
 
+import asyncio
+
 import pytest
 
-from hiyal.memory.short_term import ContextEntry, FileStorage, InMemoryStorage, SQLiteStorage
+from hiyal.memory.short_term import ContextEntry, FileStorage, InMemoryStorage, RewindEntry, SQLiteStorage
 
 
 @pytest.fixture(params=["memory", "jsonl", "txt", "md", "sqlite"])
@@ -119,3 +121,23 @@ class TestGet:
             storage.add("a", entry)
         wanted = [entry.id_ for entry in reversed(entries)]
         assert [entry.id_ for entry in storage.get("a", wanted)] == wanted
+
+
+def test_the_index_lists_each_entrys_id_and_type_in_order_per_session(storage):
+    interleaved(storage)
+    storage.add("a", RewindEntry(to_id="x"))
+    expected = [(entry.id_, type(entry).__name__) for entry in storage.entries("a")]
+    assert storage.index("a") == expected and [name for _, name in expected][-1] == "RewindEntry"
+    assert [entry_id for entry_id, _ in storage.index("b")] == [entry.id_ for entry in storage.entries("b")]
+    assert storage.index("never-used") == []
+
+
+def test_the_async_index_is_the_same(storage):
+    interleaved(storage)
+    assert asyncio.run(storage.index_async("a")) == storage.index("a")
+
+
+def test_get_after_index_returns_just_those_entries(storage):
+    interleaved(storage)
+    ids = [entry_id for entry_id, _ in storage.index("a")]
+    assert [entry.text for entry in storage.get("a", [ids[2], ids[0]])] == ["a3", "a1"]

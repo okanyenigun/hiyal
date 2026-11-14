@@ -14,6 +14,7 @@ from hiyal.memory.short_term import (
 from hiyal.models.schemas import LLMResponse
 from hiyal.prompts import UserPrompt
 from hiyal.prompts.hub import hub
+from hiyal.utility import Tokens
 
 
 DEFAULT_NOTES_INSTRUCTIONS = hub.get("memory/notes", "v1")
@@ -122,6 +123,56 @@ class TestLeftOutSections:
     def test_the_first_notes_have_nothing_to_lose(self):
         update = NoteTaker(FakeLLM(json.dumps({"destination": "Kyoto"})), schema=TripNotes).update(None, [context("a")])
         assert update.notes["destination"] == "Kyoto"
+
+
+BIG = {"destination": "Kyoto", "constraints": [f"constraint {n}" for n in range(10)], "next_step": None}
+
+
+class TestSizeLimit:
+    @pytest.fixture(autouse=True)
+    def count_words(self, monkeypatch):
+        """Count words instead of tokens, so no test loads a tiktoken encoding (that needs network)."""
+        monkeypatch.setattr(Tokens, "count", staticmethod(lambda text, encoding="o200k_base": len(text.split())))
+
+    def test_under_the_limit_the_instructions_alone(self):
+        llm = FakeLLM(notes_json(destination="Kyoto"))
+        NoteTaker(llm, TripNotes, max_tokens=100).update(BIG, [context("c")])
+        assert llm.calls[0]["system_prompt"].text == DEFAULT_NOTES_INSTRUCTIONS
+
+    def test_over_the_limit_the_same_update_also_condenses(self):
+        llm = FakeLLM(notes_json(destination="Kyoto", constraints=["constraints 0 to 9"]))
+        update = NoteTaker(llm, TripNotes, max_tokens=20).update(BIG, [context("c")])
+        system = llm.calls[0]["system_prompt"].text
+        assert system.startswith(f"{DEFAULT_NOTES_INSTRUCTIONS} {hub.get('memory/condense_notes', 'v1')}")
+        assert system.endswith("Aim for about 15 words (at most 20 tokens).")
+        assert update.notes["constraints"] == ["constraints 0 to 9"] and len(llm.calls) == 1
+
+    def test_a_condensed_answer_that_empties_a_section_is_refused(self):
+        llm = FakeLLM(notes_json(destination="Kyoto", constraints=[]))
+        with pytest.raises(ValueError, match="condensed notes empty sections that had content: constraints"):
+            NoteTaker(llm, TripNotes, max_tokens=20).update(BIG, [context("c")])
+
+    def test_without_condensing_a_section_can_still_be_emptied_on_purpose(self):
+        llm = FakeLLM(notes_json(destination="Kyoto", constraints=[]))
+        assert NoteTaker(llm, TripNotes, max_tokens=100).update(BIG, [context("c")]).notes["constraints"] == []
+
+    def test_an_answer_still_over_the_limit_is_kept_and_the_next_update_asks_again(self):
+        llm = FakeLLM(json.dumps(BIG))
+        taker = NoteTaker(llm, TripNotes, max_tokens=20)
+        update = taker.update(BIG, [context("c")])
+        assert update.notes == BIG and len(llm.calls) == 1 and taker.condenses(update.notes)
+
+    def test_without_a_limit_it_never_condenses(self):
+        assert not NoteTaker(FakeLLM(), TripNotes).condenses(BIG)
+
+    @pytest.mark.parametrize("settings, message", [
+        ({"max_tokens": 0}, "max_tokens must be a positive integer"),
+        ({"max_tokens": True}, "max_tokens must be a positive integer"),
+        ({"encoding": "nope"}, "unknown encoding"),
+    ])
+    def test_invalid_settings(self, settings, message):
+        with pytest.raises(ValueError, match=message):
+            NoteTaker(FakeLLM(), TripNotes, **settings)
 
 
 class TestAsync:

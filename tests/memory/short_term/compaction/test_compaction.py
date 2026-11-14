@@ -5,6 +5,7 @@ import pytest
 
 from hiyal.memory.short_term import (
     BaseCompaction,
+    HybridCompaction,
     RebuildCompaction,
     RollingCompaction,
     SummaryEntry,
@@ -18,7 +19,7 @@ from hiyal.prompts import UserPrompt
 def mode(request, monkeypatch):
     """Run every test twice: through ``compact``, then through ``compact_async``, which must behave the same."""
     if request.param == "async":
-        for cls in (RollingCompaction, RebuildCompaction):
+        for cls in (RollingCompaction, RebuildCompaction, HybridCompaction):
             original = cls.compact_async
             monkeypatch.setattr(cls, "compact", lambda self, newly, previous, covered, original=original:
                                 asyncio.run(original(self, newly, previous, covered)))
@@ -62,9 +63,9 @@ def turns(count, start=1):
     return entries
 
 
-def summary_of(entries, text="earlier"):
+def summary_of(entries, text="earlier", version=1):
     """A summary covering ``entries``, as the manager records it."""
-    return SummaryEntry(text=text, covers_through=entries[-1].id_, covers_count=len(entries))
+    return SummaryEntry(text=text, covers_through=entries[-1].id_, covers_count=len(entries), version=version)
 
 
 class TestRollingCompaction:
@@ -101,6 +102,42 @@ class TestRebuildCompaction:
     def test_nothing_new_to_summarize(self):
         with pytest.raises(ValueError, match="nothing to summarize"):
             RebuildCompaction(FakeSummarizer()).compact([], None, [])
+
+
+class TestHybridCompaction:
+    def test_rolls_between_rebuilds(self):
+        summarizer = FakeSummarizer()
+        old, newly = turns(2), turns(1, start=3)
+        compaction = HybridCompaction(summarizer, rebuild_every=3)
+        previous = summary_of(old, version=1)  # the next is version 2: a roll
+        assert not compaction.needs_covered(previous)
+        compaction.compact(newly, previous, [])
+        assert summarizer.calls == [(["q3", "a3"], "earlier")]
+
+    def test_rebuilds_every_rebuild_every_versions(self):
+        summarizer = FakeSummarizer()
+        old, newly = turns(2), turns(1, start=3)
+        compaction = HybridCompaction(summarizer, rebuild_every=3)
+        previous = summary_of(old, version=2)  # the next is version 3: a rebuild
+        assert compaction.needs_covered(previous)
+        compaction.compact(newly, previous, old)
+        assert summarizer.calls == [(["q1", "a1", "q2", "a2", "q3", "a3"], None)]
+
+    def test_the_first_summary_rolls_unless_every_version_is_rebuilt(self):
+        assert not HybridCompaction(FakeSummarizer(), rebuild_every=3).needs_covered(None)
+        assert HybridCompaction(FakeSummarizer(), rebuild_every=1).needs_covered(None)
+
+    @pytest.mark.parametrize("rebuild_every", [0, -2, 1.5, True])
+    def test_rebuild_every_must_be_a_positive_integer(self, rebuild_every):
+        with pytest.raises(ValueError, match="rebuild_every must be a positive integer"):
+            HybridCompaction(FakeSummarizer(), rebuild_every=rebuild_every)
+
+
+class TestNeedsCovered:
+    def test_rolling_never_and_rebuild_always(self):
+        previous = summary_of(turns(1))
+        assert not RollingCompaction(FakeSummarizer()).needs_covered(previous)
+        assert RebuildCompaction(FakeSummarizer()).needs_covered(previous)
 
 
 class TestAsync:

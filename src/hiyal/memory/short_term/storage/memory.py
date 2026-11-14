@@ -55,6 +55,9 @@ class InMemoryStorage(BaseStorage):
     async def entries_async(self, session_id: str) -> list[Entry]:
         return self.entries(session_id)
 
+    async def index_async(self, session_id: str) -> list[tuple[str, str]]:
+        return self.index(session_id)
+
     async def get_async(self, session_id: str, entry_ids: list[str]) -> list[Entry]:
         return self.get(session_id, entry_ids)
 

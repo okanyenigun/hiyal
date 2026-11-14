@@ -5,10 +5,12 @@ from pydantic import ValidationError
 
 from hiyal.memory.short_term import (
     ContextEntry,
+    RewindEntry,
     SummaryEntry,
     ToolResultEntry,
     WorkingNotesEntry,
 )
+from hiyal.memory.short_term.entry import media_count
 from hiyal.models.schemas import LLMResponse
 from hiyal.prompts import Image, SystemPrompt, UserPrompt
 
@@ -30,6 +32,7 @@ def every_memory_entry():
                         output={"c": 21}),
         SummaryEntry(text="Trip to Japan in April.", covers_through="b", covers_count=2),
         WorkingNotesEntry(notes={"objective": "Compare three technologies", "decisions": []}),
+        RewindEntry(to_id="a"),
     ]
 
 
@@ -124,6 +127,15 @@ class TestToText:
     def test_summary(self):
         assert SummaryEntry(text="Trip to Japan.", covers_through="a", covers_count=1).to_text() == \
             "Summary of the earlier conversation:\nTrip to Japan."
+
+    def test_rewind_marker(self):
+        assert RewindEntry(to_id="abc").to_text() == "Rewound to entry abc"
+
+    def test_media_count_by_kind(self):
+        png = Image(data=PNG, mime_type="image/png")
+        assert media_count(UserPrompt(text="q", images=[png, png])) == {"image": 2, "audio": 0, "document": 0}
+        assert media_count(ContextEntry(images=[png])) == {"image": 1, "audio": 0, "document": 0}
+        assert media_count(SystemPrompt(text="s")) == {"image": 0, "audio": 0, "document": 0}
 
     def test_a_summary_covers_everything_up_to_its_last_entry_except_its_exceptions(self):
         summary = SummaryEntry(text="s", covers_through="d", covers_except=["a", "c"], covers_count=2)

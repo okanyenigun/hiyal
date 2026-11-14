@@ -26,7 +26,7 @@ from hiyal.memory.short_term import (
     InMemoryStorage,
     NoteTaker,
     ShortTermMemoryManager,
-    RollingCompaction,
+    HybridCompaction,
     SummaryEntry,
     WorkingNotesEntry,
 )
@@ -34,7 +34,7 @@ from hiyal.prompts import SystemPrompt, UserPrompt
 from hiyal.utility import Tokens
 
 from tests.memory.short_term.note_takers.test_note_taker import FakeLLM, TripNotes, notes_json
-from tests.memory.short_term.test_manager import POLICIES, TextSummarizer, answer, filters_keep, result
+from tests.memory.short_term.test_manager import POLICIES, TextSummarizer, answer, filters_keep, history, result
 
 SEEDS = range(150)
 STEPS = 30
@@ -56,7 +56,8 @@ class EndlessLLM(FakeLLM):
 
 def settings(policy_name, storage=None, session_id=None):
     return dict(storage=storage or InMemoryStorage(), policy=POLICIES[policy_name](),
-                compaction=RollingCompaction(TextSummarizer()),
+                # Hybrid: both rolling and rebuilding run, under rewinds, policy switches and resumes.
+                compaction=HybridCompaction(TextSummarizer(), rebuild_every=3),
                 note_taker=NoteTaker(EndlessLLM(), schema=TripNotes), notes_every=2, session_id=session_id)
 
 
@@ -94,7 +95,7 @@ def tokens(entries):
 
 
 def check_invariants(manager, where):
-    added = [e for e in manager.entries if not isinstance(e, (SummaryEntry, WorkingNotesEntry))]
+    added = history(manager)  # the rewinds applied
     window = [e.id_ for e in manager.window]
     covers = manager.summary.covered([e.id_ for e in added]) if manager.summary else []
     covered = set(covers)
@@ -130,7 +131,7 @@ def storage_copy(manager):
 
 
 def check_resume(manager, again, where):
-    latest = [e.id_ for e in manager.entries if isinstance(e, SystemPrompt)][-1]
+    latest = [e.id_ for e in history(manager) if isinstance(e, SystemPrompt)][-1]
     live = [e.id_ for e in manager.window if not isinstance(e, SystemPrompt) or e.id_ == latest]  # see the docstring
     assert [e.id_ for e in again.window] == live, (
         f"{where}: the resumed window differs\n  live:    {[label(e) for e in manager.window]}\n"
@@ -139,6 +140,8 @@ def check_resume(manager, again, where):
     summary_id = manager.summary.id_ if manager.summary else None
     assert (again.summary.id_ if again.summary else None) == summary_id, f"{where}: the resume made a new summary"
     assert again.notes == manager.notes, f"{where}: the resumed notes differ"
+    assert (again._since_notes, again._turns_since_notes) == (manager._since_notes, manager._turns_since_notes), \
+        f"{where}: the resumed note taker would get different entries"
 
 
 def label(entry):
@@ -165,6 +168,10 @@ def run_session(seed, several_system_prompts, resume):
         elif roll < 0.25:
             policy_name = rng.choice(list(POLICIES))
             manager.policy = POLICIES[policy_name]()
+        elif roll < 0.3:
+            manager.set_notes("next_step", f"set at step {step}")
+        elif roll < 0.36:
+            manager.rewind(rng.choice(history(manager)).id_)
         where = f"seed {seed}, step {step}, policy {policy_name}"
         check_invariants(manager, where)
         if resume:
@@ -190,6 +197,10 @@ async def run_session_async(seed, several_system_prompts, resume):
         elif roll < 0.25:
             policy_name = rng.choice(list(POLICIES))
             await manager.set_policy_async(POLICIES[policy_name]())
+        elif roll < 0.3:
+            await manager.set_notes_async("next_step", f"set at step {step}")
+        elif roll < 0.36:
+            await manager.rewind_async(rng.choice(history(manager)).id_)
         where = f"seed {seed}, step {step}, policy {policy_name} (async)"
         check_invariants(manager, where)
         if resume:

@@ -13,7 +13,9 @@ class RollingCompaction(BaseCompaction):
     cannot come back.
     """
 
-    uses_covered = False
+    def needs_covered(self, previous: SummaryEntry | None) -> bool:
+        """Never: only the previous summary is sent, not its originals."""
+        return False
 
     def compact(
         self, newly: list[Entry], previous: SummaryEntry | None, covered: list[Entry]

@@ -5,6 +5,7 @@ import pytest
 
 from hiyal.memory.short_term import (
     ContextEntry,
+    RewindEntry,
     FileStorage,
     SummaryEntry,
     ToolResultEntry,
@@ -33,6 +34,7 @@ def every_entry():
                         output={"c": 21}),
         SummaryEntry(text="Trip to Japan.", covers_through="a", covers_count=1),
         WorkingNotesEntry(notes={"objective": "Compare", "decisions": ["Exclude large-scale"]}),
+        RewindEntry(to_id="a"),
     ]
 
 

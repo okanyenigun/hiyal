@@ -14,16 +14,23 @@ from hiyal.memory.short_term import (
     ContextEntry,
     FileStorage,
     FullPolicy,
+    HeadTailPolicy,
+    HybridCompaction,
     InMemoryStorage,
     LastNPolicy,
+    PredicateFilterPolicy,
+    RewindEntry,
+    MEDIA_TOKENS,
     ShortTermMemoryManager,
     SlidingWindowPolicy,
     SQLiteStorage,
+    TokenWindowPolicy,
     ToolResultEntry,
     TypeFilterPolicy,
 )
+from hiyal.memory.short_term.manager import _Row
 from hiyal.models.schemas import LLMResponse, ResponseMessage, ToolCallContent
-from hiyal.prompts import SystemPrompt, UserPrompt
+from hiyal.prompts import Document, Image, SystemPrompt, UserPrompt
 from hiyal.tools import ToolCall
 from hiyal.utility import Tokens
 
@@ -60,13 +67,19 @@ def mode(request, monkeypatch):
             self.__dict__.update(asyncio.run(manager.open_async(*args, **kwargs)).__dict__)
 
         monkeypatch.setattr(manager, "__init__", opened)
-        for name in ("add", "compact", "refresh_notes", "dump"):
+        for name in ("add", "compact", "refresh_notes", "set_notes", "rewind", "dump"):
             monkeypatch.setattr(manager, name, _run_async(name))
         for name in ("active", "window", "summary", "notes", "pinned", "entries"):
             monkeypatch.setattr(manager, name, _read_async(name))
         monkeypatch.setattr(manager, "policy", property(
             lambda self: self._policy, lambda self, policy: asyncio.run(self.set_policy_async(policy))))
     return request.param
+
+
+@pytest.fixture(autouse=True)
+def count_words(monkeypatch):
+    """Count words instead of tokens, so no test loads a tiktoken encoding (that needs network)."""
+    monkeypatch.setattr(Tokens, "count", staticmethod(lambda text, encoding="o200k_base": len(text.split())))
 
 
 def notes(*texts):
@@ -77,12 +90,19 @@ def texts(entries):
     return [entry.text for entry in entries]
 
 
+def history(manager):
+    """The session's added entries that count: the stored ones with the rewinds applied, summaries and notes left out."""
+    entries = manager.entries
+    rows = [_Row(e.id_, type(e).__name__, getattr(e, "to_id", None)) for e in entries]
+    kept = {row.id_ for row in ShortTermMemoryManager._effective(rows)}
+    return [e for e in entries if e.id_ in kept and not isinstance(e, (SummaryEntry, WorkingNotesEntry))]
+
+
 def covered(manager):
     """The IDs the current summary covers, read against the session's history."""
     if manager.summary is None:
         return []
-    originals = [e.id_ for e in manager.entries if not isinstance(e, (SummaryEntry, WorkingNotesEntry))]
-    return manager.summary.covered(originals)
+    return manager.summary.covered([e.id_ for e in history(manager)])
 
 
 def managed(entries, **settings):
@@ -121,7 +141,49 @@ class TestPrimaryStorage:
         entry = ContextEntry(text="a")
         ShortTermMemoryManager(storage, session_id="s1").add(entry)
         with pytest.raises(ValueError, match="already in the session"):
-            ShortTermMemoryManager(storage, session_id="s1").add(entry)
+            ShortTermMemoryManager(storage, session_id="s1").add(ContextEntry(id_=entry.id_, text="other"))
+
+
+class TestRepeatedAdd:
+    def test_adding_the_same_entry_again_does_nothing(self):
+        dump = InMemoryStorage()
+        entry = ContextEntry(text="a")
+        manager = managed([entry, *notes("b")], dump_storage=dump, dump_every=3)
+        manager.add(entry)
+        assert texts(manager.entries) == ["a", "b"] and texts(manager.window) == ["a", "b"]
+        manager.add(ContextEntry(text="c"))  # the third add: the repeat was not counted
+        assert texts(dump.entries(manager.session_id)) == ["a", "b", "c"]
+
+    def test_a_response_repeats_without_its_raw_payload_counting(self):
+        reply = answer("r1")
+        manager = managed([UserPrompt(text="q1"), reply])
+        manager.add(reply.model_copy(update={"raw": {"provider": "payload"}}))
+        assert len(manager.entries) == 2
+
+    def test_a_repeat_after_a_restart_does_nothing(self):
+        storage = InMemoryStorage()
+        photo = UserPrompt(text="b", images=[Image(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")])
+        ShortTermMemoryManager(storage, session_id="s1").add(photo)
+        ShortTermMemoryManager(storage, session_id="s1").add(photo)
+        assert len(storage.entries("s1")) == 1
+
+    @pytest.mark.parametrize("make", [lambda path: SQLiteStorage(":memory:"), lambda path: FileStorage(path / "h.jsonl")])
+    def test_a_repeat_is_recognized_after_a_round_trip_through_storage(self, make, tmp_path):
+        storage = make(tmp_path)
+        entries = [UserPrompt(text="q", images=[Image(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")]), answer("r")]
+        manager = ShortTermMemoryManager(storage, session_id="s1")
+        for entry in entries:
+            manager.add(entry)
+        for entry in entries:
+            manager.add(entry)
+        assert len(storage.entries("s1")) == 2
+
+    def test_a_rewound_entry_added_again_is_still_refused(self):
+        manager = managed(notes("a", "b"))
+        a, b = manager.entries
+        manager.rewind(a.id_)
+        with pytest.raises(ValueError, match="already in the session"):
+            manager.add(b)
 
 
 class TestDump:
@@ -201,7 +263,7 @@ class TestActiveWindow:
         entry = ContextEntry(text="a")
         manager = managed([entry])
         with pytest.raises(ValueError):
-            manager.add(entry)
+            manager.add(ContextEntry(id_=entry.id_, text="other"))
         assert texts(manager.active) == ["a"]
 
     def test_dumping_leaves_the_window_as_it_is(self):
@@ -250,6 +312,12 @@ POLICIES = {
     "filter-then-sliding": lambda: ChainPolicy([TypeFilterPolicy(exclude=[ContextEntry]), SlidingWindowPolicy(4, 2)]),
     # Written window first: the chain runs the filter first anyway, so no drift.
     "sliding-then-filter": lambda: ChainPolicy([SlidingWindowPolicy(6, 3), TypeFilterPolicy(exclude=[ContextEntry])]),
+    "head-tail-2-3": lambda: HeadTailPolicy(2, 3),
+    "short-only": lambda: PredicateFilterPolicy(lambda entry: len(entry.to_text()) < 40),
+    "short-then-head-tail": lambda: ChainPolicy([PredicateFilterPolicy(lambda entry: len(entry.to_text()) < 40),
+                                                 HeadTailPolicy(1, 3)]),
+    "tokens-12-6": lambda: TokenWindowPolicy(12, 6),
+    "filter-then-tokens": lambda: ChainPolicy([TypeFilterPolicy(exclude=[ContextEntry]), TokenWindowPolicy(10, 4)]),
     "last-then-filter": lambda: ChainPolicy([LastNPolicy(3), TypeFilterPolicy(exclude=[ContextEntry])]),
 }
 
@@ -426,6 +494,50 @@ class TestCompaction:
         by_text = {entry.text: entry.id_ for entry in manager.entries if isinstance(entry, ContextEntry)}
         assert covered(manager) == [by_text["a"], by_text["b"]]
 
+    def test_each_summary_is_one_version_after_the_previous(self):
+        manager = compacting(notes("a", "b", "c", "d"), policy=LastNPolicy(1))
+        assert [e.version for e in manager.entries if isinstance(e, SummaryEntry)] == [1, 2, 3]
+
+    def test_a_hybrid_compaction_rebuilds_every_n_versions_and_loads_the_originals_only_then(self):
+        summarizer, handed = FakeSummarizer(), []
+
+        class Recording(HybridCompaction):
+            """Records how many originals the manager handed over for each update."""
+
+            def compact(self, newly, previous, covered):
+                handed.append(len(covered))
+                return super().compact(newly, previous, covered)
+
+            async def compact_async(self, newly, previous, covered):
+                handed.append(len(covered))
+                return await super().compact_async(newly, previous, covered)
+
+        manager = managed(notes("a", "b", "c", "d", "e"), policy=LastNPolicy(1),
+                          compaction=Recording(summarizer, rebuild_every=2))
+        assert summarizer.calls == [
+            (["a"], None),                      # v1: rolls
+            (["a", "b"], None),                 # v2: rebuilt from the originals
+            (["c"], "summary #2 of a b"),       # v3: rolls
+            (["a", "b", "c", "d"], None),       # v4: rebuilt
+        ]
+        assert handed == [0, 1, 0, 3]  # the originals are loaded on the rebuilds only
+        assert manager.summary.version == 4
+
+    def test_a_continued_session_keeps_the_hybrid_rhythm(self):
+        storage, summarizer = InMemoryStorage(), FakeSummarizer()
+
+        def opened():
+            return ShortTermMemoryManager(storage, policy=LastNPolicy(1), session_id="s1",
+                                          compaction=HybridCompaction(summarizer, rebuild_every=2))
+
+        first = opened()
+        for entry in notes("a", "b", "c"):
+            first.add(entry)  # v1 rolls, v2 rebuilt
+        again = opened()
+        for entry in notes("d", "e"):
+            again.add(entry)  # v3 rolls, v4 rebuilt
+        assert summarizer.calls[2:] == [(["c"], "summary #2 of a b"), (["a", "b", "c", "d"], None)]
+
     def test_a_sliding_window_gives_one_summary_per_jump(self):
         summarizer = FakeSummarizer()
         compacting(notes(*"abcdefgh"), summarizer, policy=SlidingWindowPolicy(4, 2))
@@ -559,11 +671,6 @@ def size(*entries):
 
 
 class TestCompactOnDemand:
-    @pytest.fixture(autouse=True)
-    def count_words(self, monkeypatch):
-        """Count words instead of tokens, so no test loads a tiktoken encoding (that needs network)."""
-        monkeypatch.setattr(Tokens, "count", staticmethod(lambda text, encoding="o200k_base": len(text.split())))
-
     def test_without_a_budget_the_whole_unpinned_window_goes_to_the_summary(self):
         summarizer = FakeSummarizer()
         manager = compacting([SystemPrompt(text="S"), *notes("a", "b", "c")], summarizer)
@@ -646,6 +753,40 @@ class TestCompactOnDemand:
             managed(notes("a")).compact()
         with pytest.raises(ValueError, match="unknown encoding"):
             compacting(notes("a")).compact(encoding="nope")
+
+    def test_each_attached_image_adds_its_estimate(self):
+        summarizer = FakeSummarizer()
+        photo = UserPrompt(text="b", images=[Image(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")])
+        manager = compacting([*notes("a"), photo], summarizer)
+        both = size(*manager.entries) + MEDIA_TOKENS["image"]
+        assert manager.compact(max_tokens=both) is None  # both fit with the image's estimate
+        manager.compact(max_tokens=both - 1)
+        assert texts(manager.window) == ["b"] and summarizer.calls == [(["a"], None)]
+
+    def test_a_document_counts_as_its_estimate(self):
+        report = ContextEntry(text="report", documents=[Document(data=b"%PDF-1.4", mime_type="application/pdf", filename="r.pdf")])
+        manager = compacting([report])
+        manager.compact(max_tokens=size(report) + MEDIA_TOKENS["document"] - 1)
+        assert manager.window == [] and manager.summary is not None
+
+    def test_the_estimates_can_be_changed_or_left_out(self):
+        photo = UserPrompt(text="b", images=[Image(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")])
+        manager = compacting([photo])
+        assert manager.compact(max_tokens=size(photo), media_tokens={}) is None  # only the placeholder text
+        manager.compact(max_tokens=size(photo) + MEDIA_TOKENS["image"], media_tokens={"image": 1000})
+        assert manager.window == []
+
+    @pytest.mark.parametrize("media_tokens, message", [
+        ({"images": 1}, "media_tokens keys must be among"),
+        ({"image": -1}, "must be a non-negative integer"),
+        ({"audio": True}, "must be a non-negative integer"),
+        ({"document": 1.5}, "must be a non-negative integer"),
+    ])
+    def test_media_tokens_must_be_known_kinds_with_non_negative_integers(self, media_tokens, message):
+        manager = compacting(notes("a"))
+        with pytest.raises(ValueError, match=message):
+            manager.compact(media_tokens=media_tokens)
+        assert texts(manager.window) == ["a"]
 
 
 def noting(entries, *answers, **settings):
@@ -778,6 +919,235 @@ class TestNotes:
     def test_invalid_settings(self, settings, message):
         with pytest.raises(ValueError, match=message):
             ShortTermMemoryManager(InMemoryStorage(), **settings)
+
+
+class TestSetNotes:
+    def test_sets_one_section_without_an_llm_call(self):
+        manager, llm = noting([UserPrompt(text="q1")], notes_json(destination="Kyoto"))
+        manager.refresh_notes()
+        manager.set_notes("next_step", "Book the hotel")
+        assert manager.notes == {"destination": "Kyoto", "constraints": [], "next_step": "Book the hotel"}
+        assert len(llm.calls) == 1
+        versions = [e for e in manager.entries if isinstance(e, WorkingNotesEntry)]
+        assert [v.source for v in versions] == ["note_taker", "app"] and manager.active[0].id_ == versions[-1].id_
+
+    def test_the_entries_since_the_last_update_stay_queued(self):
+        manager, llm = noting([UserPrompt(text="q1")], notes_json(destination="Kyoto"),
+                              notes_json(destination="Kyoto", next_step="Book the hotel"))
+        manager.refresh_notes()
+        manager.add(UserPrompt(text="q2"))
+        manager.set_notes("next_step", "Book the hotel")
+        manager.add(UserPrompt(text="q3"))
+        manager.refresh_notes()
+        assert sent(llm) == "User: q2\n\nUser: q3"
+        assert '"next_step": "Book the hotel"' in llm.calls[1]["user_prompt"].text  # the note taker sees it
+
+    def test_notes_every_still_counts_the_turns_since_the_last_update(self):
+        manager, llm = noting([UserPrompt(text="q1"), answer("r1")], notes_json(destination="Kyoto"), notes_every=2)
+        manager.set_notes("next_step", "Book the hotel")
+        manager.add(UserPrompt(text="q2"))
+        assert llm.calls == []
+        manager.add(answer("r2"))  # the second finished turn: set_notes did not restart the count
+        assert sent(llm) == "User: q1\n\nAssistant: r1\n\nUser: q2\n\nAssistant: r2"
+
+    def test_the_first_notes_can_start_from_one_section(self):
+        manager, _ = noting([UserPrompt(text="q1")])
+        manager.set_notes("next_step", "Plan the route")
+        assert manager.notes == {"next_step": "Plan the route"}
+
+    def test_without_a_note_taker_any_section_and_json_value(self):
+        manager = managed(notes("a"))
+        manager.set_notes("budget", {"usd": 3000})
+        assert manager.notes == {"budget": {"usd": 3000}} and isinstance(manager.active[0], WorkingNotesEntry)
+
+    def test_a_continued_session_still_hands_the_note_taker_what_arrived_since_its_update(self):
+        storage = InMemoryStorage()
+        first = ShortTermMemoryManager(storage, note_taker=NoteTaker(FakeLLM(notes_json(destination="Kyoto")),
+                                                                     schema=TripNotes), session_id="s1")
+        first.add(UserPrompt(text="q1"))
+        first.refresh_notes()
+        first.add(UserPrompt(text="q2"))
+        first.set_notes("next_step", "Book the hotel")
+        llm = FakeLLM(notes_json(destination="Kyoto", next_step="Book the hotel"))
+        again = ShortTermMemoryManager(storage, note_taker=NoteTaker(llm, schema=TripNotes), session_id="s1")
+        assert again.notes["next_step"] == "Book the hotel"
+        again.add(UserPrompt(text="q3"))
+        again.refresh_notes()
+        assert sent(llm) == "User: q2\n\nUser: q3"
+
+    @pytest.mark.parametrize("section, value, error, message", [
+        ("constraints", "not a list", ValueError, "does not fit section 'constraints' of TripNotes"),
+        ("budget", 3000, ValueError, "'budget' is not a section of TripNotes"),
+        ("", "x", ValueError, "section"),
+        (None, "x", TypeError, "section"),
+    ])
+    def test_refused_changing_nothing(self, section, value, error, message):
+        manager, _ = noting([UserPrompt(text="q1")], notes_json(destination="Kyoto"))
+        manager.refresh_notes()
+        before = (manager.notes, len(manager.entries))
+        with pytest.raises(error, match=message):
+            manager.set_notes(section, value)
+        assert (manager.notes, len(manager.entries)) == before
+
+
+class Spying(InMemoryStorage):
+    """Counts full reads of a session and records the IDs fetched; its index is cheap, like SQLite's."""
+
+    def __init__(self):
+        super().__init__()
+        self.full_reads, self.fetched = 0, []
+
+    def entries(self, session_id):
+        self.full_reads += 1
+        return super().entries(session_id)
+
+    def index(self, session_id):
+        return [(entry.id_, type(entry).__name__) for entry in InMemoryStorage.entries(self, session_id)]
+
+    def get(self, session_id, entry_ids):
+        self.fetched += list(entry_ids)
+        return self._pick(session_id, list(entry_ids), InMemoryStorage.entries(self, session_id))
+
+
+class TestReadingLittle:
+    @staticmethod
+    def opened(storage):
+        return ShortTermMemoryManager(storage, policy=LastNPolicy(2), compaction=RollingCompaction(FakeSummarizer()),
+                                      session_id="s1")
+
+    def test_a_continued_session_fetches_only_the_summary_and_the_window(self):
+        storage = Spying()
+        first = self.opened(storage)
+        for entry in notes(*map(str, range(30))):
+            first.add(entry)
+        storage.full_reads, storage.fetched = 0, []
+        again = self.opened(storage)
+        assert storage.full_reads == 0 and len(storage.fetched) == 3  # the summary, then the two-entry window
+        assert [e.id_ for e in again.active] == [e.id_ for e in first.active]
+
+    def test_set_policy_and_rewind_never_read_the_whole_session(self):
+        storage = Spying()
+        manager = self.opened(storage)
+        for entry in notes(*map(str, range(30))):
+            manager.add(entry)
+        target = history(manager)[-2].id_  # "28"
+        storage.full_reads = 0
+        manager.policy = LastNPolicy(3)
+        manager.rewind(target)
+        assert storage.full_reads == 0
+        assert texts(manager.window) == ["27", "28"]
+
+    def test_with_notes_every_only_the_entries_since_the_notes_are_fetched_for_the_turn_count(self):
+        storage = Spying()
+        taker = NoteTaker(FakeLLM(notes_json(destination="Kyoto")), schema=TripNotes)
+        first = ShortTermMemoryManager(storage, note_taker=taker, notes_every=5, session_id="s1")
+        for entry in [UserPrompt(text="q1"), answer("r1")]:
+            first.add(entry)
+        first.refresh_notes()
+        for entry in [UserPrompt(text="q2"), answer("r2")]:
+            first.add(entry)
+        storage.fetched = []
+        again = ShortTermMemoryManager(storage, note_taker=taker, notes_every=5, session_id="s1")
+        assert again._turns_since_notes == 1 and again._since_notes == first._since_notes
+        q1, r1, notes_version, q2, r2 = first.entries
+        # The notes version (to see who wrote it), then only q2 and r2 for the turn count; the rest is the window.
+        assert storage.fetched[:3] == [notes_version.id_, q2.id_, r2.id_]
+
+
+class TestRewind:
+    def test_what_came_after_no_longer_counts_and_nothing_is_removed(self):
+        manager = managed(notes("a", "b", "c", "d"))
+        manager.rewind(manager.entries[1].id_)
+        assert texts(manager.window) == ["a", "b"]
+        stored = manager.entries
+        assert texts(stored[:4]) == ["a", "b", "c", "d"] and isinstance(stored[4], RewindEntry)
+
+    def test_new_entries_continue_from_there(self):
+        manager = managed(notes("a", "b", "c"))
+        manager.rewind(manager.entries[0].id_)
+        manager.add(ContextEntry(text="d"))
+        assert texts(manager.window) == ["a", "d"]
+
+    def test_the_summary_goes_back_to_what_it_was_without_a_new_call(self):
+        summarizer = FakeSummarizer()
+        manager = compacting(notes("a", "b", "c", "d", "e"), summarizer, policy=LastNPolicy(2))
+        c = next(e for e in history(manager) if e.text == "c")
+        calls = len(summarizer.calls)
+        manager.rewind(c.id_)
+        assert texts(manager.active) == ["summary #1 of a", "b", "c"] and len(summarizer.calls) == calls
+
+    def test_rewinding_past_every_summary_leaves_none(self):
+        manager = compacting(notes("a", "b", "c", "d"), policy=LastNPolicy(2))
+        manager.rewind(manager.entries[1].id_)  # b, added before any summary
+        assert manager.summary is None and texts(manager.window) == ["a", "b"]
+
+    def test_the_notes_and_the_note_takers_queue_go_back_too(self):
+        manager, llm = noting([UserPrompt(text="q1")], notes_json(destination="Kyoto"),
+                              notes_json(destination="Tokyo"), notes_json(destination="Osaka"))
+        manager.refresh_notes()
+        q1 = manager.entries[0]
+        manager.add(UserPrompt(text="q2"))
+        manager.refresh_notes()
+        manager.rewind(q1.id_)
+        assert manager.notes["destination"] == "Kyoto"
+        manager.add(UserPrompt(text="q3"))
+        manager.refresh_notes()
+        assert sent(llm) == "User: q3"  # q2 no longer counts
+
+    def test_the_system_prompt_goes_back_too(self):
+        manager = managed([SystemPrompt(text="S1"), *notes("a"), SystemPrompt(text="S2"), *notes("b")])
+        manager.rewind(manager.entries[1].id_)
+        assert texts(manager.window) == ["S1", "a"] and texts(manager.pinned) == ["S1"]
+
+    def test_pins_on_entries_still_there_are_kept(self):
+        manager = managed(notes("a", "b"), policy=LastNPolicy(1))
+        b = manager.entries[1]
+        manager.pin(b.id_)
+        for entry in notes("c", "d"):
+            manager.add(entry)
+        manager.rewind(manager.entries[2].id_)  # c
+        assert texts(manager.window) == ["b", "c"] and b.id_ in {e.id_ for e in manager.pinned}
+
+    def test_a_continued_session_comes_back_rewound(self):
+        storage = InMemoryStorage()
+
+        def opened():
+            return ShortTermMemoryManager(storage, policy=LastNPolicy(2), compaction=RollingCompaction(FakeSummarizer()),
+                                          session_id="s1")
+
+        first = opened()
+        for entry in notes("a", "b", "c", "d", "e"):
+            first.add(entry)
+        first.rewind(next(e for e in history(first) if e.text == "c").id_)
+        first.add(ContextEntry(text="f"))
+        again = opened()
+        assert [e.id_ for e in again.active] == [e.id_ for e in first.active]
+        assert texts(again.active) == ["summary #4 of b", "c", "f"]  # b left when f came: the 4th call
+
+    def test_a_marker_whose_entry_is_not_there_is_ignored(self):
+        storage = InMemoryStorage()
+        for entry in [*notes("a"), RewindEntry(to_id="gone"), *notes("b")]:
+            storage.add("s1", entry)
+        assert texts(ShortTermMemoryManager(storage, session_id="s1").window) == ["a", "b"]
+
+    def test_a_rewound_entrys_id_cannot_be_used_again(self):
+        manager = managed(notes("a", "b"))
+        b = manager.entries[1]
+        manager.rewind(manager.entries[0].id_)
+        with pytest.raises(ValueError, match="already in the session"):
+            manager.add(ContextEntry(id_=b.id_, text="b again"))
+
+    def test_refused_changing_nothing(self):
+        manager = compacting(notes("a", "b", "c"), policy=LastNPolicy(1))
+        a, summary, c = manager.entries[0], manager.summary, history(manager)[2]
+        manager.rewind(a.id_)
+        count = len(manager.entries)
+        for entry_id in (summary.id_, c.id_, "nope"):
+            with pytest.raises(ValueError, match="not in the history"):
+                manager.rewind(entry_id)
+        with pytest.raises(ValueError, match="rewinds come from rewind"):
+            manager.add(RewindEntry(to_id=a.id_))
+        assert len(manager.entries) == count
 
 
 def filters_keep(policy, entries):

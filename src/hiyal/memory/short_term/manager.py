@@ -1,12 +1,22 @@
 """The component that manages a session's short-term memory."""
 
 import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Self
+from typing import Any, NamedTuple, Self
 from uuid import uuid4
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError, create_model
 from .compaction import BaseCompaction
-from .entry import Entry, SummaryEntry, WorkingNotesEntry, finishes_turn, is_derived
+from .entry import (
+    Entry,
+    RewindEntry,
+    SummaryEntry,
+    WorkingNotesEntry,
+    finishes_turn,
+    MEDIA_TOKENS,
+    check_media_tokens,
+    entry_tokens,
+)
 from .note_takers import BaseNoteTaker, NotesUpdate
 from .policies import BasePolicy, FullPolicy
 from .storage import BaseStorage
@@ -14,6 +24,18 @@ from ...models.schemas import LLMResponse
 from ...prompts import SystemPrompt
 from ...utility import Checks, Tokens
 from ...utility.tokens import DEFAULT_ENCODING
+
+
+class _Row(NamedTuple):
+    """One stored entry as the storage's index lists it: its ID, its class name, and a rewind marker's target."""
+
+    id_: str
+    type: str
+    to_id: str | None = None
+
+
+# Class names of the entries made by workers, never added to the conversation.
+_DERIVED = {SummaryEntry.__name__, WorkingNotesEntry.__name__}
 
 
 @dataclass(frozen=True)
@@ -90,16 +112,22 @@ class ShortTermMemoryManager:
       of a turn). So an update never catches a question without its answer;
       the notes can still lag up to ``notes_every - 1`` finished turns
       behind. An app that never adds the model's answers finishes no turns:
-      its notes update only on ``refresh_notes()``.
+      its notes update only on ``refresh_notes()``. The app can also set
+      one section directly with ``set_notes()``, without an LLM call: a new
+      version too, which leaves the entries since the last update queued.
       There is one version at most in ``active``, right after the summary;
       it is never in the window, so the policy cannot drop it.
+    - **Rewinding:** ``rewind(entry_id)`` takes the session back to just
+      after an entry, as it was before the next one was added; what came
+      after no longer counts. The storage stays append-only: a
+      ``RewindEntry`` marks it, and reading the history applies it.
 
     The window is the policy's choice plus the pinned entries: a cut can
     leave an answer without its question, or a tool result without its call.
 
     **Async:** every operation has an ``_async`` twin (``add_async``,
-    ``compact_async``, ``refresh_notes_async``, ``dump_async``,
-    ``set_policy_async``), and every read an ``_async`` method
+    ``compact_async``, ``refresh_notes_async``, ``set_notes_async``,
+    ``rewind_async``, ``dump_async``, ``set_policy_async``), and every read an ``_async`` method
     (``active_async()``, ``window_async()``, ...), using the storages',
     compaction's and note taker's async methods. A manager for async code is
     made with ``await ShortTermMemoryManager.open_async(...)``, since reading
@@ -151,16 +179,19 @@ class ShortTermMemoryManager:
         ``dump_storage``, or ``notes_every`` without a ``note_taker``, or
         if either is not a positive integer.
 
-        For a continued session, the stored entries are read once, here: the
-        latest system prompt is pinned again (pins live only in memory), the
-        latest summary is the current one, and the window is chosen from the
-        entries it does not cover, considering only the latest system prompt
-        (an older one is not restored, even if it was still in the window).
-        With a ``compaction``, any of those the
+        For a continued session, the state is read back here: the storage's
+        index of the session first (IDs and types, see
+        ``BaseStorage.index``), then only the entries it needs, not the
+        whole history. The latest system prompt is pinned again (pins live
+        only in memory), the latest summary is the current one, and the
+        window is chosen from the entries it does not cover, considering
+        only the latest system prompt (an older one is not restored, even if
+        it was still in the window). With a ``compaction``, any of those the
         window leaves out are summarized here (an LLM call), which happens
         only if they were never summarized (a session that had no
         compaction, or a compaction that failed). The latest notes are the
-        current ones, and the entries stored after them are the ones since.
+        current ones, and the entries stored after the note taker's last
+        version are the ones since.
         """
         self._configure(
             storage,
@@ -172,9 +203,8 @@ class ShortTermMemoryManager:
             notes_every,
             session_id,
         )
-        stored = self.storage.entries(self.session_id)
-        self._restore(stored)
-        self._settle(self._rechoose_pool(stored))
+        self._read_state()
+        self._settle(self._pool())
 
     @classmethod
     async def open_async(
@@ -200,9 +230,8 @@ class ShortTermMemoryManager:
             notes_every,
             session_id,
         )
-        stored = await manager.storage.entries_async(manager.session_id)
-        manager._restore(stored)
-        await manager._settle_async(manager._rechoose_pool(stored))
+        await manager._read_state_async()
+        await manager._settle_async(await manager._pool_async())
         return manager
 
     def _configure(
@@ -239,43 +268,98 @@ class ShortTermMemoryManager:
         # One async operation at a time.
         self._lock = asyncio.Lock()
 
-    def _restore(self, stored: list[Entry]) -> None:
-        """Set the state from the session's ``stored`` entries; no I/O."""
+    def _read_state(self) -> None:
+        """Set the state from the storage: its index of the session, then only the entries needed; the window is left to ``_settle``."""
+        rows = self.storage.index(self.session_id)
+        markers = self.storage.get(self.session_id, self._marker_ids(rows))
+        history = self._restore(rows, markers)
+        start = None
+        for notes_id in self._notes_ids(history):
+            (version,) = self.storage.get(self.session_id, [notes_id])
+            if self._as(version, WorkingNotesEntry).source == "note_taker":
+                start = notes_id
+                break
+        since = self._queue_since(history, start)
+        if self.notes_every is not None:
+            self._turns_since_notes = sum(
+                finishes_turn(e) for e in self.storage.get(self.session_id, since)
+            )
+
+    async def _read_state_async(self) -> None:
+        """``_read_state``, with async I/O."""
+        rows = await self.storage.index_async(self.session_id)
+        markers = await self.storage.get_async(self.session_id, self._marker_ids(rows))
+        history = self._restore(rows, markers)
+        start = None
+        for notes_id in self._notes_ids(history):
+            (version,) = await self.storage.get_async(self.session_id, [notes_id])
+            if self._as(version, WorkingNotesEntry).source == "note_taker":
+                start = notes_id
+                break
+        since = self._queue_since(history, start)
+        if self.notes_every is not None:
+            entries = await self.storage.get_async(self.session_id, since)
+            self._turns_since_notes = sum(finishes_turn(e) for e in entries)
+
+    @staticmethod
+    def _marker_ids(rows: list[tuple[str, str]]) -> list[str]:
+        """The IDs of the rewind markers among the index's ``rows``: the only entries the history's shape needs."""
+        return [entry_id for entry_id, name in rows if name == RewindEntry.__name__]
+
+    def _restore(self, rows: list[tuple[str, str]], markers: list[Entry]) -> list[_Row]:
+        """Set what the index gives (``rows``, with the rewind ``markers``' targets), and return the history; no I/O.
+
+        The history is the rows with the rewinds applied. The note taker's
+        queue is set by ``_queue_since``; until then it is empty.
+        """
         # Adds since the last dump: what dump_every counts.
         self._adds_since_dump: int = 0
-        # IDs in the primary storage, so a duplicate is caught without reading it.
-        self._ids: set[str] = {entry.id_ for entry in stored}
+        # IDs in the primary storage, so a duplicate is caught without reading it;
+        # all of them, also the ones a rewind dropped, which stay stored.
+        self._ids: set[str] = {entry_id for entry_id, _ in rows}
+        targets = {m.id_: self._as(m, RewindEntry).to_id for m in markers}
+        history = self._effective(
+            [_Row(entry_id, name, targets.get(entry_id)) for entry_id, name in rows]
+        )
         # IDs of the original entries (not summaries or notes), in history
         # order, and where each one is: what a summary's coverage is read against.
-        self._originals: list[str] = [e.id_ for e in stored if not is_derived(e)]
+        self._originals: list[str] = [r.id_ for r in history if r.type not in _DERIVED]
         self._position: dict[str, int] = {
             entry_id: i for i, entry_id in enumerate(self._originals)
         }
         # IDs of every system prompt, so pin() can refuse them without reading them.
         self._system_ids: set[str] = {
-            e.id_ for e in stored if isinstance(e, SystemPrompt)
+            r.id_ for r in history if r.type == SystemPrompt.__name__
         }
         # The pinned system prompt: the latest one added.
-        self._system_id: str | None = self._latest_id(stored, SystemPrompt)
+        self._system_id: str | None = self._latest_id(history, SystemPrompt)
         # The current summary: the latest one made. Not in the window; always first in active.
-        self._summary_id: str | None = self._latest_id(stored, SummaryEntry)
+        self._summary_id: str | None = self._latest_id(history, SummaryEntry)
         # The current notes: the latest version. Not in the window; right after the summary in active.
-        self._notes_id: str | None = self._latest_id(stored, WorkingNotesEntry)
-        # IDs added since the current notes version, in order: what the next update gets.
-        last_notes = max(
-            (i for i, e in enumerate(stored) if isinstance(e, WorkingNotesEntry)),
-            default=-1,
-        )
-        since = [entry for entry in stored[last_notes + 1 :] if not is_derived(entry)]
-        self._since_notes: list[str] = [entry.id_ for entry in since]
-        # How many turns those finish: what notes_every counts.
-        self._turns_since_notes: int = sum(finishes_turn(entry) for entry in since)
+        self._notes_id: str | None = self._latest_id(history, WorkingNotesEntry)
+        # IDs added since the note taker's last version, in order: what its next
+        # update gets (a version the app set with set_notes does not count).
+        self._since_notes: list[str] = []
+        # How many turns those finish: what notes_every counts (only with it).
+        self._turns_since_notes: int = 0
         # IDs that the policy can never remove from the window; always in the window.
         self._pinned: set[str] = (
             {self._system_id} if self._system_id is not None else set()
         )
         # IDs of the window, in history order; the entries stay in the primary.
         self._window: list[str] = []
+        return history
+
+    @staticmethod
+    def _notes_ids(history: list[_Row]) -> list[str]:
+        """The notes versions in ``history``, newest first: where to look for the note taker's last one."""
+        return [r.id_ for r in reversed(history) if r.type == WorkingNotesEntry.__name__]
+
+    def _queue_since(self, history: list[_Row], notes_id: str | None) -> list[str]:
+        """Set the note taker's queue: the original entries after its last version ``notes_id`` (all without one)."""
+        start = next((i + 1 for i, r in enumerate(history) if r.id_ == notes_id), 0)
+        self._since_notes = [r.id_ for r in history[start:] if r.type not in _DERIVED]
+        return self._since_notes
 
     # ------------------------------------------------------------------ the policy
 
@@ -294,13 +378,13 @@ class ShortTermMemoryManager:
         out are summarized now. Pins are kept.
         """
         self._policy = policy
-        self._settle(self._rechoose_pool(self.entries))
+        self._settle(self._pool())
 
     async def set_policy_async(self, policy: BasePolicy) -> None:
         """Setting ``policy``, with async I/O."""
         async with self._lock:
             self._policy = policy
-            await self._settle_async(self._rechoose_pool(await self.entries_async()))
+            await self._settle_async(await self._pool_async())
 
     # ------------------------------------------------------------------ add
 
@@ -323,11 +407,19 @@ class ShortTermMemoryManager:
            last dump, calls ``dump()``. Last, so the dump includes the new
            summary and notes.
 
-        Raises ``ValueError`` if an entry with the same ``id_`` is already
-        there (IDs must be unique, since the dump tells entries apart by
-        ID), or for a ``SummaryEntry`` or ``WorkingNotesEntry``: they come
-        from the compaction and the note taker.
+        Adding an entry that is already there again, with the same content
+        and still in the history, does nothing: it is a repeat (a retried
+        delivery), so an app can retry an ``add`` it is unsure about.
+        Content is compared as stored, so ``LLMResponse.raw`` does not count.
+
+        Raises ``ValueError`` if another entry with the same ``id_`` is
+        already there, or one a rewind dropped (IDs must be unique, since
+        the dump tells entries apart by ID), or for a ``SummaryEntry``,
+        ``WorkingNotesEntry`` or ``RewindEntry``: they come from the
+        compaction, the notes and ``rewind``.
         """
+        if self._repeats(entry, self._stored_copy(entry)):
+            return
         self._check_new(entry)
         self.storage.add(self.session_id, entry)
         previous_system = self._record(entry)
@@ -343,6 +435,13 @@ class ShortTermMemoryManager:
     async def add_async(self, entry: Entry) -> None:
         """``add``, with async I/O."""
         async with self._lock:
+            stored = (
+                (await self.storage.get_async(self.session_id, [entry.id_]))[0]
+                if entry.id_ in self._position
+                else None
+            )
+            if self._repeats(entry, stored):
+                return
             self._check_new(entry)
             await self.storage.add_async(self.session_id, entry)
             previous_system = self._record(entry)
@@ -356,12 +455,31 @@ class ShortTermMemoryManager:
             if self._dump_due:
                 await self._dump_async()
 
+    def _stored_copy(self, entry: Entry) -> Entry | None:
+        """The stored entry with ``entry``'s ID, if one is in the history; read only then."""
+        if entry.id_ not in self._position:
+            return None
+        return self.storage.get(self.session_id, [entry.id_])[0]
+
+    @staticmethod
+    def _repeats(entry: Entry, stored: Entry | None) -> bool:
+        """Whether ``entry`` repeats ``stored``: the same class and the same content, as stored."""
+        return (
+            stored is not None
+            and type(stored) is type(entry)
+            and stored.model_dump_json() == entry.model_dump_json()
+        )
+
     def _check_new(self, entry: Entry) -> None:
         """Raise ``ValueError`` for an entry ``add`` refuses."""
         if isinstance(entry, SummaryEntry):
             raise ValueError("summaries come from compaction, not add()")
         if isinstance(entry, WorkingNotesEntry):
-            raise ValueError("working notes come from the note taker, not add()")
+            raise ValueError(
+                "working notes come from the note taker or set_notes(), not add()"
+            )
+        if isinstance(entry, RewindEntry):
+            raise ValueError("rewinds come from rewind(), not add()")
         if entry.id_ in self._ids:
             raise ValueError(
                 f"an entry with id_ {entry.id_!r} is already in the session"
@@ -373,7 +491,8 @@ class ShortTermMemoryManager:
         self._position[entry.id_] = len(self._originals)
         self._originals.append(entry.id_)
         self._since_notes.append(entry.id_)
-        self._turns_since_notes += finishes_turn(entry)
+        if self.notes_every is not None:
+            self._turns_since_notes += finishes_turn(entry)
         self._adds_since_dump += 1
         if not isinstance(entry, SystemPrompt):
             return None
@@ -402,7 +521,10 @@ class ShortTermMemoryManager:
     # ------------------------------------------------------------------ compact
 
     def compact(
-        self, max_tokens: int | None = None, encoding: str = DEFAULT_ENCODING
+        self,
+        max_tokens: int | None = None,
+        encoding: str = DEFAULT_ENCODING,
+        media_tokens: Mapping[str, int] = MEDIA_TOKENS,
     ) -> SummaryUpdate | None:
         """Move the oldest window entries into the summary now: all of them, or until the window fits ``max_tokens``.
 
@@ -415,8 +537,11 @@ class ShortTermMemoryManager:
 
         Only the window is counted, not the summary or the notes. Tokens are
         counted on each entry's ``to_text()`` with ``encoding``
-        (``Tokens.count``): close, not exact, for other providers' models,
-        and media count only as their placeholder.
+        (``Tokens.count``): close, not exact, for other providers' models.
+        Each attached image, audio clip and document adds its estimate from
+        ``media_tokens`` (keys ``"image"``, ``"audio"``, ``"document"``; a
+        kind left out counts 0, so ``{}`` counts media only as their
+        placeholder text). The default is ``MEDIA_TOKENS``.
 
         A one-time squeeze: on the next adds, the policy chooses from the
         smaller window, so it can grow again. What was summarized never
@@ -432,30 +557,36 @@ class ShortTermMemoryManager:
         ``None`` when nothing was summarized (the window already fits).
         Raises ``ValueError``, changing nothing, if there is no
         ``compaction``, ``max_tokens`` is not a non-negative integer,
-        ``encoding`` is unknown, or the pinned entries alone take more than
+        ``encoding`` is unknown, ``media_tokens`` has another key or a value
+        that is not a non-negative integer, or the pinned entries alone take more than
         ``max_tokens``. If the compaction fails, its error is raised and the
         window stays as it was.
         """
-        self._check_compact(max_tokens, encoding)
+        self._check_compact(max_tokens, encoding, media_tokens)
         window = self.window
-        kept, dropped = self._squeeze(window, max_tokens, encoding)
+        kept, dropped = self._squeeze(window, max_tokens, encoding, media_tokens)
         update = self._summarize(dropped) if dropped else None
         self._window = [entry.id_ for entry in window if entry.id_ in kept]
         return update
 
     async def compact_async(
-        self, max_tokens: int | None = None, encoding: str = DEFAULT_ENCODING
+        self,
+        max_tokens: int | None = None,
+        encoding: str = DEFAULT_ENCODING,
+        media_tokens: Mapping[str, int] = MEDIA_TOKENS,
     ) -> SummaryUpdate | None:
         """``compact``, with async I/O."""
         async with self._lock:
-            self._check_compact(max_tokens, encoding)
+            self._check_compact(max_tokens, encoding, media_tokens)
             window = await self.window_async()
-            kept, dropped = self._squeeze(window, max_tokens, encoding)
+            kept, dropped = self._squeeze(window, max_tokens, encoding, media_tokens)
             update = await self._summarize_async(dropped) if dropped else None
             self._window = [entry.id_ for entry in window if entry.id_ in kept]
             return update
 
-    def _check_compact(self, max_tokens: int | None, encoding: str) -> None:
+    def _check_compact(
+        self, max_tokens: int | None, encoding: str, media_tokens: Mapping[str, int]
+    ) -> None:
         """Raise ``ValueError`` for a ``compact`` that cannot run."""
         if self.compaction is None:
             raise ValueError("this manager has no compaction")
@@ -468,15 +599,20 @@ class ShortTermMemoryManager:
                 f"max_tokens must be a non-negative integer or None, got {max_tokens!r}"
             )
         Tokens.require_encoding(encoding)
+        check_media_tokens(media_tokens)
 
     def _squeeze(
-        self, window: list[Entry], max_tokens: int | None, encoding: str
+        self,
+        window: list[Entry],
+        max_tokens: int | None,
+        encoding: str,
+        media_tokens: Mapping[str, int],
     ) -> tuple[set[str], list[Entry]]:
         """The IDs ``compact`` keeps in ``window``, and the entries it summarizes."""
         kept = {entry.id_ for entry in window if entry.id_ in self._pinned}
         if max_tokens is not None:
             used = sum(
-                Tokens.count(entry.to_text(), encoding)
+                entry_tokens(entry, encoding, media_tokens)
                 for entry in window
                 if entry.id_ in kept
             )
@@ -487,7 +623,7 @@ class ShortTermMemoryManager:
             for entry in reversed(window):
                 if entry.id_ in kept:
                     continue
-                used += Tokens.count(entry.to_text(), encoding)
+                used += entry_tokens(entry, encoding, media_tokens)
                 if used > max_tokens:
                     break
                 kept.add(entry.id_)
@@ -544,6 +680,57 @@ class ShortTermMemoryManager:
         self._notes_id = entry.id_
         self._since_notes = []
         self._turns_since_notes = 0
+
+    def set_notes(self, section: str, value: JsonValue) -> None:
+        """Set one section of the working notes to ``value`` directly, without an LLM call.
+
+        For what the app knows for certain (a budget typed into a form, a
+        booking number a tool returned). The current notes with that section
+        replaced (or added) are stored as a new version, which becomes the
+        current one. The entries since the note taker's last update stay
+        queued: its next update still gets them, along with these notes.
+
+        With a ``note_taker``, ``section`` must be one of its schema's fields
+        and ``value`` must fit that field; it is stored as the schema
+        serializes it. Without one, any section and JSON value will do.
+        Raises ``TypeError`` or ``ValueError``, changing nothing, otherwise.
+        """
+        entry = self._notes_with(self.notes, section, value)
+        self.storage.add(self.session_id, entry)
+        self._ids.add(entry.id_)
+        self._notes_id = entry.id_
+
+    async def set_notes_async(self, section: str, value: JsonValue) -> None:
+        """``set_notes``, with async I/O."""
+        async with self._lock:
+            entry = self._notes_with(await self.notes_async(), section, value)
+            await self.storage.add_async(self.session_id, entry)
+            self._ids.add(entry.id_)
+            self._notes_id = entry.id_
+
+    def _notes_with(
+        self, notes: dict[str, JsonValue] | None, section: str, value: JsonValue
+    ) -> WorkingNotesEntry:
+        """The app's notes version: ``notes`` with ``section`` set to the checked ``value``."""
+        Checks.non_empty_string(section, "section")
+        if self.note_taker is not None:
+            schema = self.note_taker.schema
+            field = schema.model_fields.get(section)
+            if field is None:
+                raise ValueError(
+                    f"{section!r} is not a section of {schema.__name__}: "
+                    f"{', '.join(schema.model_fields)}"
+                )
+            # A model with only this field, keeping its type and constraints.
+            definition: dict[str, Any] = {section: (field.annotation, field)}
+            one = create_model(schema.__name__, **definition)
+            try:
+                value = one.model_validate({section: value}).model_dump(mode="json")[section]
+            except ValidationError as error:
+                raise ValueError(
+                    f"{value!r} does not fit section {section!r} of {schema.__name__}: {error}"
+                ) from error
+        return WorkingNotesEntry(notes={**(notes or {}), section: value}, source="app")
 
     # ------------------------------------------------------------------ dump
 
@@ -624,6 +811,88 @@ class ShortTermMemoryManager:
             )
         self._pinned.discard(entry_id)
 
+    # ------------------------------------------------------------------ rewind
+
+    def rewind(self, entry_id: str) -> None:
+        """Go back to just after the entry with ``entry_id``: what was added after it no longer counts.
+
+        The session becomes what it was just before the next entry was
+        added: the window, the summary, the notes and the system prompt as
+        they were then (the summary and notes made right after that entry
+        stay), and the note taker's queue with them. New adds continue from
+        there. Pins on entries that are still there are kept.
+
+        Nothing is removed from the storage: a ``RewindEntry`` is stored,
+        and reading the history applies it, so a continued session comes
+        back the same. ``entries`` still lists everything, the rewound
+        entries and the marker too, and their IDs cannot be used again.
+
+        The window is chosen from the history up to there with the current
+        policy; with the policy the session had then, that is the window it
+        had, and nothing is summarized. With another policy, what it leaves
+        out is summarized (an LLM call), as on ``policy``.
+
+        Raises ``ValueError``, changing nothing, unless ``entry_id`` names an
+        added entry still in the history (not a summary, notes, a rewind
+        marker, or an entry already rewound).
+        """
+        self._check_rewind(entry_id)
+        self.storage.add(self.session_id, RewindEntry(to_id=entry_id))
+        pins, adds = self._pinned, self._adds_since_dump
+        self._read_state()
+        self._keep(pins, adds)
+        self._settle(self._pool())
+
+    async def rewind_async(self, entry_id: str) -> None:
+        """``rewind``, with async I/O."""
+        async with self._lock:
+            self._check_rewind(entry_id)
+            await self.storage.add_async(self.session_id, RewindEntry(to_id=entry_id))
+            pins, adds = self._pinned, self._adds_since_dump
+            await self._read_state_async()
+            self._keep(pins, adds)
+            await self._settle_async(await self._pool_async())
+
+    def _check_rewind(self, entry_id: str) -> None:
+        """Raise ``ValueError`` unless ``entry_id`` names an added entry still in the history."""
+        Checks.non_empty_string(entry_id, "entry_id")
+        if entry_id not in self._position:
+            raise ValueError(
+                f"entry {entry_id!r} is not in the history; only an added entry not "
+                "already rewound can be rewound to"
+            )
+
+    def _keep(self, pins: set[str], adds: int) -> None:
+        """After a rewind read the state back: keep the ``pins`` on entries still there, and the dump count."""
+        self._pinned |= {
+            entry_id
+            for entry_id in pins
+            if entry_id in self._position and entry_id not in self._system_ids
+        }
+        self._adds_since_dump = adds
+
+    @staticmethod
+    def _effective(rows: list[_Row]) -> list[_Row]:
+        """The entries that count, oldest first: ``rows`` with each rewind marker applied in order.
+
+        A marker drops what was stored after its entry, from the next added
+        entry on: the summaries and notes made right after it stay. The
+        marker itself is left out. One whose entry is not there is ignored.
+        """
+        history: list[_Row] = []
+        for row in rows:
+            if row.type != RewindEntry.__name__:
+                history.append(row)
+                continue
+            ids = [r.id_ for r in history]
+            if row.to_id not in ids:
+                continue
+            end = ids.index(row.to_id) + 1
+            while end < len(history) and history[end].type in _DERIVED:
+                end += 1
+            del history[end:]
+        return history
+
     # ------------------------------------------------------------------ reads
 
     @property
@@ -697,7 +966,11 @@ class ShortTermMemoryManager:
 
     @property
     def entries(self) -> list[Entry]:
-        """The session's entries in the primary storage, oldest first."""
+        """The session's entries in the primary storage, oldest first.
+
+        Everything stored: after a ``rewind``, also the rewound entries and
+        the ``RewindEntry`` marker.
+        """
         return self.storage.entries(self.session_id)
 
     async def entries_async(self) -> list[Entry]:
@@ -726,23 +999,23 @@ class ShortTermMemoryManager:
 
     # ------------------------------------------------------------------ the window
 
-    def _rechoose_pool(self, entries: list[Entry]) -> list[Entry]:
+    def _pool(self) -> list[Entry]:
         """What the window is chosen from again: the history, minus what the summary covers and old system prompts."""
-        summary = next(
-            (entry for entry in entries if entry.id_ == self._summary_id), None
-        )
-        covered = (
-            set(summary.covered([e.id_ for e in entries if not is_derived(e)]))
-            if isinstance(summary, SummaryEntry)
-            else set()
-        )
-        replaced = {
-            e.id_
-            for e in entries
-            if isinstance(e, SystemPrompt) and e.id_ != self._system_id
-        }
+        return self.storage.get(self.session_id, self._pool_ids(self.summary))
+
+    async def _pool_async(self) -> list[Entry]:
+        """``_pool``, with async I/O."""
+        summary = await self.summary_async()
+        return await self.storage.get_async(self.session_id, self._pool_ids(summary))
+
+    def _pool_ids(self, summary: SummaryEntry | None) -> list[str]:
+        """The IDs of ``_pool``, from the history's order kept in memory; no I/O."""
+        covered = set(summary.covered(self._originals)) if summary is not None else set()
         return [
-            e for e in entries if e.id_ not in covered | replaced and not is_derived(e)
+            entry_id
+            for entry_id in self._originals
+            if entry_id not in covered
+            and (entry_id not in self._system_ids or entry_id == self._system_id)
         ]
 
     def _settle(self, pool: list[Entry]) -> None:
@@ -813,7 +1086,7 @@ class ShortTermMemoryManager:
         previous = self.summary
         covered = (
             self.storage.get(self.session_id, previous.covered(self._originals))
-            if previous is not None and self.compaction.uses_covered
+            if previous is not None and self.compaction.needs_covered(previous)
             else []
         )
         response = self.compaction.compact(dropped, previous, covered)
@@ -830,7 +1103,7 @@ class ShortTermMemoryManager:
             await self.storage.get_async(
                 self.session_id, previous.covered(self._originals)
             )
-            if previous is not None and self.compaction.uses_covered
+            if previous is not None and self.compaction.needs_covered(previous)
             else []
         )
         response = await self.compaction.compact_async(dropped, previous, covered)
@@ -863,6 +1136,7 @@ class ShortTermMemoryManager:
             covers_through=self._originals[end - 1],
             covers_except=skipped,
             covers_count=count,
+            version=previous.version + 1 if previous is not None else 1,
         )
 
     def _install_summary(self, summary: SummaryEntry) -> None:
@@ -871,8 +1145,6 @@ class ShortTermMemoryManager:
         self._summary_id = summary.id_
 
     @staticmethod
-    def _latest_id(entries: list[Entry], kind: type) -> str | None:
-        """The ID of the latest entry of type ``kind`` in ``entries``, or ``None``."""
-        return next(
-            (entry.id_ for entry in reversed(entries) if isinstance(entry, kind)), None
-        )
+    def _latest_id(history: list[_Row], kind: type) -> str | None:
+        """The ID of the latest entry of type ``kind`` in ``history``, or ``None``."""
+        return next((r.id_ for r in reversed(history) if r.type == kind.__name__), None)

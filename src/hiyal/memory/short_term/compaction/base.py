@@ -2,7 +2,6 @@
 
 import asyncio
 from abc import ABC, abstractmethod
-from typing import ClassVar
 from ..summarizers import BaseSummarizer
 from ..entry import Entry, SummaryEntry
 from ....models.schemas import LLMResponse
@@ -20,17 +19,22 @@ class BaseCompaction(ABC):
     what leaves its window, and what ``compact()`` moves out of it.
 
     Compactions differ in what they send to the summarizer: the previous
-    summary and only the new entries (``RollingCompaction``), or all the
-    original entries again (``RebuildCompaction``).
+    summary and only the new entries (``RollingCompaction``), all the
+    original entries again (``RebuildCompaction``), or the first most of the
+    time and the second every few versions (``HybridCompaction``).
     """
-
-    # Whether ``compact`` reads ``covered``; when not, a caller can pass an
-    # empty list instead of loading the previous summary's originals.
-    uses_covered: ClassVar[bool] = True
 
     def __init__(self, summarizer: BaseSummarizer) -> None:
         """Use ``summarizer`` for the summary text."""
         self.summarizer = summarizer
+
+    def needs_covered(self, previous: SummaryEntry | None) -> bool:
+        """Whether the update after ``previous`` reads ``covered``.
+
+        When it does not, a caller can pass an empty list instead of loading
+        the previous summary's originals. By default it does.
+        """
+        return True
 
     @abstractmethod
     def compact(
