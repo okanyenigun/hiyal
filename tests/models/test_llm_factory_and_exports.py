@@ -1,4 +1,5 @@
 import importlib
+import importlib.metadata
 
 import pytest
 from pydantic import ValidationError
@@ -51,7 +52,8 @@ class TestFactory:
 
 class TestExports:
     def test_version(self):
-        assert hiyal.__version__ == "0.0.1"
+        # The installed package's version comes from pyproject.toml, so this holds across releases.
+        assert hiyal.__version__ == importlib.metadata.version("hiyal")
 
     @pytest.mark.parametrize("module_name, names", [
         ("hiyal.models", models.__all__),
