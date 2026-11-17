@@ -1,50 +1,51 @@
-"""Policy that keeps the newest entries within a token limit, cutting well below it."""
+"""TokenWindowPolicy: keeps the newest entries within a token limit, cutting well below it."""
 
-from collections.abc import Mapping
-from .base import BasePolicy
-from ..entry import MEDIA_TOKENS, Entry, check_media_tokens, entry_tokens
+from collections.abc import Callable
+from .base import WindowPolicy
+from ..schemas import Entry
 from ....utility import Checks, Tokens
-from ....utility.tokens import DEFAULT_ENCODING
 
 
-class TokenWindowPolicy(BasePolicy):
-    """The newest entries within ``max_tokens``; once they pass it, the oldest leave until ``target_tokens`` is reached.
+def text_tokens(entry: Entry) -> int:
+    """The tokens in ``entry.to_text()``, in tiktoken's default encoding.
 
-    ``SlidingWindowPolicy`` in tokens: the start of the window stays put
-    while new entries arrive, and jumps forward only when the window passes
-    ``max_tokens``, far enough to get it back down to ``target_tokens``.
-    The gap between the two means one cut (with a compaction, one summary)
-    every few adds instead of on every add.
+    Media count only as their placeholders' text; pass ``TokenWindowPolicy``
+    a counter that adds an estimate for them when entries carry media.
+    """
+    return Tokens.count(entry.to_text())
 
-    Example with ``max_tokens=100_000, target_tokens=50_000``: the window
-    grows 40k, 70k, 98k with nothing leaving; the add that takes it to
-    103k drops the oldest entries until it is at most 50k; then it grows
-    again until the next cut.
 
-    The window is computed from the entries alone, by replaying the cuts
-    from the oldest one, so the same entries always give the same window:
-    one chosen add by add matches one chosen from the whole history (a
-    continued session). The newest entry always stays, even when it alone
-    passes ``max_tokens``; it leaves at the next cut.
+class TokenWindowPolicy(WindowPolicy):
+    """The newest entries within ``max_tokens``; once they pass it, the oldest are dropped until ``target_tokens``.
 
-    Tokens are counted as ``compact`` counts them: each entry's
-    ``to_text()`` with ``encoding``, plus ``media_tokens`` for each attached
-    image, audio clip and document. Entries the policy is not given
-    (pinned ones, those a filter removed) do not count.
+    ``SlidingWindowPolicy`` in tokens: the start stays put while new entries
+    arrive, and jumps forward only when the window passes ``max_tokens``,
+    far enough to get it back to ``target_tokens``. The gap between the two
+    means one cut every few entries instead of one per entry. With
+    ``max_tokens=100_000, target_tokens=50_000``: the window grows 40k, 70k,
+    98k; the entry that takes it to 103k drops the oldest until it is at
+    most 50k; then it grows again.
+
+    The cuts are replayed from the oldest entry, so the same entries always
+    give the same window. The newest entry always stays, even when it alone
+    passes ``max_tokens``.
+
+    Each entry's size comes from ``count``: ``text_tokens`` by default, or
+    the same counter the rest of the memory uses.
     """
 
     def __init__(
         self,
         max_tokens: int,
         target_tokens: int | None = None,
-        encoding: str = DEFAULT_ENCODING,
-        media_tokens: Mapping[str, int] = MEDIA_TOKENS,
+        *,
+        count: Callable[[Entry], int] = text_tokens,
     ) -> None:
         """Keep the window within ``max_tokens``, cutting it to ``target_tokens`` (half of ``max_tokens`` when ``None``).
 
-        Raises ``ValueError`` unless ``max_tokens`` is a positive integer,
-        ``target_tokens`` a positive integer no larger than it, ``encoding``
-        known, and ``media_tokens`` valid (see ``compact``).
+        Raises ``ValueError`` unless ``max_tokens`` is a positive integer and
+        ``target_tokens`` a positive integer no larger than it, and
+        ``TypeError`` if ``count`` is not callable.
         """
         self.max_tokens = Checks.positive_int(max_tokens, "max_tokens")
         if target_tokens is None:
@@ -54,17 +55,18 @@ class TokenWindowPolicy(BasePolicy):
             raise ValueError(
                 f"target_tokens ({target_tokens}) cannot be larger than max_tokens ({max_tokens})"
             )
-        self.encoding = Tokens.require_encoding(encoding)
-        self.media_tokens = check_media_tokens(media_tokens)
+        if not callable(count):
+            raise TypeError(f"count must be callable, got {count!r}")
+        self.count = count
 
     def select(self, entries: list[Entry]) -> list[Entry]:
-        """Return the entries inside the current window, oldest first."""
-        return list(entries[self.start(entries) :])
+        """The entries from the window's start (see ``start``) on."""
+        return entries[self.start(entries) :]
 
     def start(self, entries: list[Entry]) -> int:
-        """Index of the window's first entry: the cuts replayed from the oldest entry on."""
+        """The index of the first kept entry: the cuts replayed from the oldest entry on."""
+        sizes = [self.count(entry) for entry in entries]
         start, total = 0, 0
-        sizes = [entry_tokens(e, self.encoding, self.media_tokens) for e in entries]
         for newest, size in enumerate(sizes):
             total += size
             if total > self.max_tokens:

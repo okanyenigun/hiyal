@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 from .base import BaseStorage
 from .formats import FORMATS, FileFormat
-from ..entry import Entry, build_entry
+from ..schemas import Entry, EntryKind
 from ....utility import Checks
 
 
@@ -17,31 +17,27 @@ class FileStorage(BaseStorage):
     - ``.txt``: each entry as readable text, followed by its record.
     - ``.md``: each entry as a Markdown section, with its record hidden in a comment.
 
-    One file can hold many sessions: each record names its session, and
-    every call reads or changes only the records of its own session. Every
-    format is read back exactly; see ``formats``. Adding an entry appends to
-    the file; removing one, or clearing a session, rewrites it. Media bytes
-    are stored as base64, and ``LLMResponse.raw`` is not stored.
+    One file can hold many sessions: each record names its session. Adding
+    an entry appends to the file; removing one, or clearing a session,
+    rewrites it. A file has no index, so every read goes through the whole
+    file, but only the entries asked for are rebuilt. Media bytes are
+    stored as base64, and ``LLMResponse.raw`` is not stored.
 
-    A lock lets one call at a time touch the file, so an append never lands
-    in the middle of a rewrite, and the storage is safe to share between
-    threads (the ``_async`` methods run in worker threads). It guards this
-    object only: two storages on the same file do not see each other's lock.
+    To keep IDs unique without reading the file on every add, the IDs are
+    read once, on first use, and kept up to date. So one storage object
+    should be the only writer of its file. Its calls take turns (a lock),
+    so the async twins inherited from ``BaseStorage`` can run them in
+    worker threads, even several at once.
     """
 
-    def __init__(
-        self,
-        path: str | Path,
-        exist_ok: bool = False,
-    ) -> None:
+    def __init__(self, path: str | Path, exist_ok: bool = False) -> None:
         """Use the file at ``path``; it and its folders are created on the first write.
 
         By default the file must not exist yet, so an existing file is never
         written to by accident: ``FileExistsError`` is raised. Pass
         ``exist_ok=True`` to continue an existing file, e.g. after a restart.
-
-        Raises ``ValueError`` for an extension other than ``.jsonl``, ``.txt``
-        or ``.md``.
+        Raises ``ValueError`` for an extension other than ``.jsonl``,
+        ``.txt`` or ``.md``.
         """
         self.path = Path(path)
         suffix = self.path.suffix.lower()
@@ -54,87 +50,106 @@ class FileStorage(BaseStorage):
                 f"{self.path} already exists; pass exist_ok=True to continue it"
             )
         self.format: FileFormat = FORMATS[suffix]
-        # One call at a time touches the file.
+        # The IDs stored in the file, per session; read on first use (see _known).
+        self._ids: dict[str, set[str]] | None = None
+        # One call at a time, as the async twins run calls in worker threads.
+        # Reentrant, as add() calls get().
         self._lock = threading.RLock()
 
-    def add(self, session_id: str, entry: Entry) -> None:
-        block = self.format.block(
-            Checks.non_empty_string(session_id, "session_id"), entry
-        )
+    def add(self, session_id: str, entry: Entry) -> bool:
         with self._lock:
+            ids = self._known().setdefault(
+                Checks.non_empty_string(session_id, "session_id"), set()
+            )
+            if entry.id_ in ids:
+                (stored,) = self.get(session_id, [entry.id_])
+                return self._repeat(session_id, entry, stored)
+            block = self.format.block(session_id, entry)
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as file:
                 file.write(block)
-
-    def remove(self, session_id: str, entry_id: str) -> None:
-        target = Checks.non_empty_string(entry_id, "entry_id")
-        Checks.non_empty_string(session_id, "session_id")
-        with self._lock:  # read and rewrite in one step
-            records = self._records()
-            for index, (session, stored) in enumerate(records):
-                if session == session_id and stored.id_ == target:
-                    self._write(records[:index] + records[index + 1 :])
-                    return
-        raise ValueError(f"entry {target!r} is not stored in session {session_id!r}")
-
-    def entries(self, session_id: str) -> list[Entry]:
-        Checks.non_empty_string(session_id, "session_id")
-        with self._lock:
-            records = self._records()
-        return [entry for session, entry in records if session == session_id]
-
-    def index(self, session_id: str) -> list[tuple[str, str]]:
-        # The whole file is read, but no entry is rebuilt.
-        Checks.non_empty_string(session_id, "session_id")
-        with self._lock:
-            raw = self._raw()
-        return [(data["id_"], name) for session, name, data in raw if session == session_id]
+            ids.add(entry.id_)
+            return True
 
     def get(self, session_id: str, entry_ids: list[str]) -> list[Entry]:
-        # A file has no index: the whole file is read, but only the wanted
-        # entries are rebuilt.
-        wanted = [
-            Checks.non_empty_string(entry_id, "entry_id") for entry_id in entry_ids
-        ]
-        Checks.non_empty_string(session_id, "session_id")
-        keep = set(wanted)
         with self._lock:
-            raw = self._raw()
-        found = [
-            build_entry(name, data)
-            for session, name, data in raw
-            if session == session_id and data["id_"] in keep
-        ]
-        return self._pick(session_id, wanted, found)
+            Checks.non_empty_string(session_id, "session_id")
+            wanted = set(entry_ids)
+            found = {
+                data["id_"]: data
+                for session, data in self._records()
+                if session == session_id and data["id_"] in wanted
+            }
+            self._missing(session_id, entry_ids, set(found))
+            return [Entry.model_validate(found[entry_id]) for entry_id in entry_ids]
 
-    def clear(self, session_id: str) -> None:
-        Checks.non_empty_string(session_id, "session_id")
-        with self._lock:  # read and rewrite in one step
+    def index(self, session_id: str) -> list[tuple[str, EntryKind]]:
+        # The whole file is read, but no entry is rebuilt.
+        with self._lock:
+            Checks.non_empty_string(session_id, "session_id")
+            return [
+                (data["id_"], EntryKind(data["kind"]))
+                for session, data in self._records()
+                if session == session_id
+            ]
+
+    def entries(self, session_id: str) -> list[Entry]:
+        with self._lock:
+            Checks.non_empty_string(session_id, "session_id")
+            return [
+                Entry.model_validate(data)
+                for session, data in self._records()
+                if session == session_id
+            ]
+
+    def remove(self, session_id: str, entry_id: str) -> None:
+        with self._lock:
+            Checks.non_empty_string(session_id, "session_id")
+            Checks.non_empty_string(entry_id, "entry_id")
             records = self._records()
             kept = [
-                (session, entry) for session, entry in records if session != session_id
+                (session, data)
+                for session, data in records
+                if not (session == session_id and data["id_"] == entry_id)
+            ]
+            if len(kept) == len(records):
+                raise ValueError(
+                    f"entry {entry_id!r} is not stored in session {session_id!r}"
+                )
+            self._write(kept)
+            self._known()[session_id].discard(entry_id)
+
+    def clear(self, session_id: str) -> None:
+        with self._lock:
+            Checks.non_empty_string(session_id, "session_id")
+            records = self._records()
+            kept = [
+                (session, data) for session, data in records if session != session_id
             ]
             if len(kept) < len(records):
                 self._write(kept)
+            self._known().pop(session_id, None)
 
-    def _records(self) -> list[tuple[str, Entry]]:
-        """Every record in the file, of every session, oldest first."""
+    def _known(self) -> dict[str, set[str]]:
+        """The IDs stored in the file, per session: read once, then kept up to date by every change."""
+        if self._ids is None:
+            self._ids = {}
+            for session, data in self._records():
+                self._ids.setdefault(session, set()).add(data["id_"])
+        return self._ids
+
+    def _records(self) -> list[tuple[str, dict[str, Any]]]:
+        """Every record in the file as ``(session_id, entry JSON)``, oldest first, nothing rebuilt."""
         if not self.path.exists():
             return []
-        text = self.path.read_text(encoding="utf-8")
-        return self.format.records(text)
+        return self.format.records(self.path.read_text(encoding="utf-8"))
 
-    def _raw(self) -> list[tuple[str, str, dict[str, Any]]]:
-        """Every record in the file as ``(session_id, type name, entry JSON)``, oldest first, nothing rebuilt."""
-        if not self.path.exists():
-            return []
-        return self.format.raw(self.path.read_text(encoding="utf-8"))
-
-    def _write(self, records: list[tuple[str, Entry]]) -> None:
+    def _write(self, records: list[tuple[str, dict[str, Any]]]) -> None:
         """Replace the file's content in one step, so a crash cannot leave it half written."""
         temporary = self.path.with_name(self.path.name + ".tmp")
         with temporary.open("w", encoding="utf-8") as file:
             file.writelines(
-                self.format.block(session, entry) for session, entry in records
+                self.format.block(session, Entry.model_validate(data))
+                for session, data in records
             )
         os.replace(temporary, self.path)

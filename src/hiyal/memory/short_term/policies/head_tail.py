@@ -1,24 +1,16 @@
-"""Policy that keeps the first entries and the last ones active."""
+"""HeadTailPolicy: keeps the first entries and the last ones."""
 
-from .base import BasePolicy
-from ..entry import Entry
+from .base import WindowPolicy
+from ..schemas import Entry
 from ....utility import Checks
 
 
-class HeadTailPolicy(BasePolicy):
-    """The first ``head`` entries and the last ``tail`` ones are active; the middle leaves.
+class HeadTailPolicy(WindowPolicy):
+    """Keeps the first ``head`` entries and the last ``tail``; the middle is dropped.
 
     For a task stated at the start: the opening entries stay, while the rest
     moves forward like ``LastNPolicy(tail)``. With 1000 entries, ``head=2``
-    and ``tail=250``, entries 1-2 and 751-1000 are active.
-
-    The head is the first entries the policy is given. In a
-    ``ShortTermMemoryManager`` those are the oldest unpinned entries not yet
-    summarized: the session's first ones, unless ``compact()`` summarized
-    them or the session switched to this policy after they had left.
-
-    Like ``LastNPolicy``, once full it drops one entry per add, so with a
-    compaction every add is a compaction call.
+    and ``tail=250``, entries 1-2 and 751-1000 are kept.
     """
 
     def __init__(self, head: int, tail: int) -> None:
@@ -27,7 +19,7 @@ class HeadTailPolicy(BasePolicy):
         self.tail = Checks.positive_int(tail, "tail")
 
     def select(self, entries: list[Entry]) -> list[Entry]:
-        """Return the first ``head`` entries and the last ``tail``, or all of them when there are no more."""
+        """The first ``head`` entries and the last ``tail``, or all of them when there are no more."""
         if len(entries) <= self.head + self.tail:
             return list(entries)
         return [*entries[: self.head], *entries[-self.tail :]]

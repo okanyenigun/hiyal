@@ -1,6 +1,6 @@
 import pytest
 
-from hiyal.memory.short_term import Summarizer
+from hiyal.memory.short_term import SingleCallSummarizer
 from hiyal.prompts.hub import PromptHub, hub
 
 
@@ -41,20 +41,19 @@ class TestPromptHub:
     def test_summarize_with_notes_leaves_the_current_state_to_the_notes(self):
         text = hub.get("memory/summarize_with_notes", "v1")
         assert "Do not restate that state" in text
-        assert Summarizer(llm=None, prompt_name="memory/summarize_with_notes").instructions == text
+        assert SingleCallSummarizer(None, prompt_name="memory/summarize_with_notes").instructions == text  # type: ignore[arg-type]
 
     def test_summarize_v2_asks_for_fixed_headings(self):
         v2 = hub.get("memory/summarize", "v2")
         headings = ["LANGUAGE:", "INTENT:", "SUMMARY:", "TOOLS:", "ARTIFACTS:", "NEXT STEPS:"]
         assert [v2.index(h) for h in headings] == sorted(v2.index(h) for h in headings)
-        assert 'Write "None"' in v2 and Summarizer(llm=None, prompt_version="v2").instructions == v2
+        assert 'Write "None"' in v2 and SingleCallSummarizer(None, prompt_version="v2").instructions == v2  # type: ignore[arg-type]
 
 
 class TestSummarizerUsesTheHub:
     def test_by_default_the_hub_prompt(self):
-        assert Summarizer(llm=None).instructions == hub.get("memory/summarize", "v1")
+        assert SingleCallSummarizer(None).instructions == hub.get("memory/summarize", "v1")  # type: ignore[arg-type]
 
-    def test_another_version_or_given_instructions(self, monkeypatch, library):
-        monkeypatch.setattr("hiyal.memory.short_term.summarizers.base.hub", library)
-        assert Summarizer(llm=None, prompt_version="v2").instructions == "Second version."
-        assert Summarizer(llm=None, instructions="Mine.").instructions == "Mine."
+    def test_another_version(self, monkeypatch, library):
+        monkeypatch.setattr("hiyal.memory.short_term.summarizers.single_call.hub", library)
+        assert SingleCallSummarizer(None, prompt_version="v2").instructions == "Second version."  # type: ignore[arg-type]

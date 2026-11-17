@@ -1,1217 +1,1201 @@
 import asyncio
 import json
 from datetime import datetime, timezone
+from uuid import UUID
 
 import pytest
+from pydantic import BaseModel, Field
 
 from hiyal.memory.short_term import (
-    ChainPolicy,
-    NoteTaker,
-    WorkingNotesEntry,
-    RebuildCompaction,
-    RollingCompaction,
-    SummaryEntry,
-    ContextEntry,
-    FileStorage,
-    FullPolicy,
+    Context,
+    Entry,
+    EntryKind,
     HeadTailPolicy,
-    HybridCompaction,
     InMemoryStorage,
     LastNPolicy,
+    NoNotesSettingsError,
+    Notes,
+    Pin,
     PredicateFilterPolicy,
-    RewindEntry,
-    MEDIA_TOKENS,
     ShortTermMemoryManager,
-    SlidingWindowPolicy,
-    SQLiteStorage,
-    TokenWindowPolicy,
-    ToolResultEntry,
-    TypeFilterPolicy,
+    SingleCallSummarizer,
+    Summary,
+    SummaryWorker,
 )
-from hiyal.memory.short_term.manager import _Row
 from hiyal.models.schemas import LLMResponse, ResponseMessage, ToolCallContent
-from hiyal.prompts import Document, Image, SystemPrompt, UserPrompt
+from hiyal.memory.short_term.manager import SummaryKeeper
+from hiyal.prompts import SystemPrompt
+from hiyal.prompts.hub import hub
 from hiyal.tools import ToolCall
 from hiyal.utility import Tokens
 
-from tests.memory.short_term.compaction.test_compaction import FakeSummarizer
-from tests.memory.short_term.note_takers.test_note_taker import FakeLLM, TripNotes, notes_json
+
+class AsyncDriven:
+    """A manager driven through its async side: opened with ``open_async``, and each method or read runs its ``_async`` twin.
+
+    The ``side`` fixture swaps it in for ``ShortTermMemoryManager``, so every
+    test written for the sync side checks the async side too.
+    """
+
+    manager_class = ShortTermMemoryManager
+    READS = {"active", "window", "pinned", "system_prompt", "summary", "notes", "entries"}
+    WRITES = {"add", "remove", "unpin", "compact", "update_notes", "set_notes", "rewind", "set_policy", "dump"}
+
+    def __init__(self, storage, **settings):
+        object.__setattr__(self, "manager", asyncio.run(self.manager_class.open_async(storage, **settings)))
+
+    def __getattr__(self, name):
+        if name in self.READS:
+            return asyncio.run(getattr(self.manager, f"{name}_async")())
+        if name in self.WRITES:
+            twin = getattr(self.manager, f"{name}_async")
+            return lambda *args, **kwargs: asyncio.run(twin(*args, **kwargs))
+        return getattr(self.manager, name)
+
+    def __setattr__(self, name, value):
+        setattr(self.manager, name, value)
 
 
-
-def _run_async(name):
-    """A sync stand-in for ``name`` that runs its ``_async`` twin."""
-    def method(self, *args, **kwargs):
-        return asyncio.run(getattr(self, f"{name}_async")(*args, **kwargs))
-    return method
-
-
-def _read_async(name):
-    """A sync stand-in for the property ``name`` that awaits ``name_async()``."""
-    return property(lambda self: asyncio.run(getattr(self, f"{name}_async")()))
+def refuse_sync(self, **parameters):
+    raise AssertionError("the async side must call query_async")
 
 
 @pytest.fixture(autouse=True, params=["sync", "async"])
-def mode(request, monkeypatch):
-    """Run every test twice: through the sync API, then through the async one.
-
-    In the async run, construction is ``open_async``, every operation its
-    ``_async`` twin and every read its ``_async`` method. A sync call left
-    inside the async path would then call ``asyncio.run`` inside the running
-    loop, and fail the test.
-    """
+def side(request, monkeypatch):
+    """Every test runs twice: on the manager's sync side, then on its async side (``AsyncDriven``)."""
     if request.param == "async":
-        manager = ShortTermMemoryManager
-
-        def opened(self, *args, **kwargs):
-            self.__dict__.update(asyncio.run(manager.open_async(*args, **kwargs)).__dict__)
-
-        monkeypatch.setattr(manager, "__init__", opened)
-        for name in ("add", "compact", "refresh_notes", "set_notes", "rewind", "dump"):
-            monkeypatch.setattr(manager, name, _run_async(name))
-        for name in ("active", "window", "summary", "notes", "pinned", "entries"):
-            monkeypatch.setattr(manager, name, _read_async(name))
-        monkeypatch.setattr(manager, "policy", property(
-            lambda self: self._policy, lambda self, policy: asyncio.run(self.set_policy_async(policy))))
+        monkeypatch.setitem(globals(), "ShortTermMemoryManager", AsyncDriven)
+        monkeypatch.setattr(ScriptedLLM, "query", refuse_sync)
     return request.param
 
 
-@pytest.fixture(autouse=True)
-def count_words(monkeypatch):
-    """Count words instead of tokens, so no test loads a tiktoken encoding (that needs network)."""
-    monkeypatch.setattr(Tokens, "count", staticmethod(lambda text, encoding="o200k_base": len(text.split())))
-
-
-def notes(*texts):
-    return [ContextEntry(text=text) for text in texts]
-
-
-def texts(entries):
-    return [entry.text for entry in entries]
-
-
-def history(manager):
-    """The session's added entries that count: the stored ones with the rewinds applied, summaries and notes left out."""
-    entries = manager.entries
-    rows = [_Row(e.id_, type(e).__name__, getattr(e, "to_id", None)) for e in entries]
-    kept = {row.id_ for row in ShortTermMemoryManager._effective(rows)}
-    return [e for e in entries if e.id_ in kept and not isinstance(e, (SummaryEntry, WorkingNotesEntry))]
-
-
-def covered(manager):
-    """The IDs the current summary covers, read against the session's history."""
-    if manager.summary is None:
-        return []
-    return manager.summary.covered([e.id_ for e in history(manager)])
-
-
-def managed(entries, **settings):
-    manager = ShortTermMemoryManager(InMemoryStorage(), **settings)
-    for entry in entries:
-        manager.add(entry)
-    return manager
-
-
 class TestSession:
-    def test_a_new_session_gets_a_generated_id(self):
-        first, second = ShortTermMemoryManager(InMemoryStorage()), ShortTermMemoryManager(InMemoryStorage())
-        assert first.session_id and first.session_id != second.session_id
+    def test_a_new_session_gets_a_generated_uuid(self):
+        first = ShortTermMemoryManager(InMemoryStorage())
+        second = ShortTermMemoryManager(InMemoryStorage())
+        assert str(UUID(first.session_id)) == first.session_id
+        assert first.session_id != second.session_id
 
-    def test_a_given_id_continues_that_session(self):
+    def test_a_given_session_id_is_kept(self):
+        assert ShortTermMemoryManager(InMemoryStorage(), session_id="trip-42").session_id == "trip-42"
+
+    def test_the_storage_is_kept(self):
         storage = InMemoryStorage()
-        ShortTermMemoryManager(storage, session_id="s1").add(ContextEntry(text="a"))
-        assert texts(ShortTermMemoryManager(storage, session_id="s1").entries) == ["a"]
-        assert ShortTermMemoryManager(storage, session_id="s2").entries == []
+        assert ShortTermMemoryManager(storage).storage is storage
 
-    @pytest.mark.parametrize("session_id, error", [("", ValueError), (7, TypeError)])
-    def test_a_given_id_must_be_a_non_empty_string(self, session_id, error):
-        with pytest.raises(error):
-            ShortTermMemoryManager(InMemoryStorage(), session_id=session_id)
+    def test_the_session_id_cannot_be_changed(self):
+        manager = ShortTermMemoryManager(InMemoryStorage(), session_id="trip-42")
+        with pytest.raises(AttributeError):
+            manager.session_id = "other"  # type: ignore[misc]
+
+    def test_an_empty_session_id_is_refused(self):
+        with pytest.raises(ValueError, match="session_id must not be empty"):
+            ShortTermMemoryManager(InMemoryStorage(), session_id="")
+
+    def test_a_session_id_that_is_not_a_string_is_refused(self):
+        with pytest.raises(TypeError, match="session_id must be a string, got int"):
+            ShortTermMemoryManager(InMemoryStorage(), session_id=42)  # type: ignore[arg-type]
+
+    def test_a_storage_that_is_not_a_storage_is_refused(self):
+        with pytest.raises(TypeError, match="storage must be a BaseStorage, got dict"):
+            ShortTermMemoryManager({})  # type: ignore[arg-type]
 
 
-class TestPrimaryStorage:
-    def test_entries_are_added_in_order(self):
-        manager = ShortTermMemoryManager(InMemoryStorage())
-        for entry in notes("a", "b", "c"):
-            manager.add(entry)
-        assert texts(manager.entries) == ["a", "b", "c"]
+class Trip(BaseModel):
+    destination: str | None = None
 
-    def test_a_duplicate_id_is_rejected_also_after_a_restart(self):
+
+LLM = object()  # the settings are only stored, never called
+
+
+def manager(**settings):
+    return ShortTermMemoryManager(InMemoryStorage(), **settings)
+
+
+class TestSettings:
+    def test_with_no_settings_every_feature_is_off(self):
+        made = manager()
+        assert made.policy is None
+        assert made.summarizer is None
+        assert (made.notes_llm, made.notes_schema, made.notes_every) == (None, None, None)
+        assert (made.dump_storage, made.dump_every) == (None, None)
+
+    def test_the_settings_are_kept(self):
+        policy, summarizer, archive = LastNPolicy(5), SingleCallSummarizer(LLM), InMemoryStorage()  # type: ignore[arg-type]
+        made = manager(policy=policy, summarizer=summarizer, notes_llm=LLM, notes_schema=Trip, notes_every=2,
+                       dump_storage=archive, dump_every=10)
+        assert made.policy is policy and made.summarizer is summarizer
+        assert (made.notes_llm, made.notes_schema, made.notes_every) == (LLM, Trip, 2)
+        assert (made.dump_storage, made.dump_every) == (archive, 10)
+
+    @pytest.mark.parametrize("settings, message", [
+        ({"policy": "LastNPolicy(5)"}, "policy must be a Policy, got str"),
+        ({"summarizer": LLM}, "summarizer must be a SummaryWorker, got object"),
+        ({"dump_storage": {}}, "dump_storage must be a BaseStorage, got dict"),
+        ({"notes_llm": LLM, "notes_schema": dict}, "notes_schema must be a Pydantic model class"),
+    ])
+    def test_a_setting_of_the_wrong_type_is_refused(self, settings, message):
+        with pytest.raises(TypeError, match=message):
+            manager(**settings)
+
+    @pytest.mark.parametrize("settings, message", [
+        ({"notes_llm": LLM, "notes_schema": Trip, "notes_every": 0}, "notes_every must be a positive integer"),
+        ({"dump_storage": InMemoryStorage(), "dump_every": -1}, "dump_every must be a positive integer"),
+        ({"notes_llm": LLM}, "notes_llm and notes_schema go together"),
+        ({"notes_schema": Trip}, "notes_llm and notes_schema go together"),
+        ({"notes_every": 3}, "notes_every needs notes_llm and notes_schema"),
+        ({"dump_every": 10}, "dump_every needs a dump_storage"),
+    ])
+    def test_settings_that_do_not_fit_are_refused(self, settings, message):
+        with pytest.raises(ValueError, match=message):
+            manager(**settings)
+
+    def test_the_notes_instructions_are_read_from_the_hub(self):
+        assert manager().notes_instructions == hub.get("memory/notes", "v1")
+        chosen = manager(notes_prompt_name="memory/condense_notes", notes_prompt_version="v1")
+        assert chosen.notes_instructions == hub.get("memory/condense_notes", "v1")
+
+    def test_a_notes_prompt_the_hub_does_not_have_is_refused(self):
+        with pytest.raises(ValueError, match="'memory/notes' has no version 'v9'"):
+            manager(notes_prompt_version="v9")
+
+
+def note(name, text=None):
+    """A context entry with ID ``name``."""
+    return Entry.of(Context(text=text or name)).model_copy(update={"id_": name})
+
+
+class TestAdd:
+    def test_an_entry_is_stored_in_the_session(self):
+        made = manager(session_id="trip")
+        assert made.add(note("a")) is True
+        assert made.add(note("b")) is True
+        assert [entry.id_ for entry in made.storage.entries("trip")] == ["a", "b"]
+
+    def test_other_sessions_in_the_storage_are_not_touched(self):
         storage = InMemoryStorage()
-        entry = ContextEntry(text="a")
-        ShortTermMemoryManager(storage, session_id="s1").add(entry)
-        with pytest.raises(ValueError, match="already in the session"):
-            ShortTermMemoryManager(storage, session_id="s1").add(ContextEntry(id_=entry.id_, text="other"))
+        ShortTermMemoryManager(storage, session_id="trip").add(note("a"))
+        assert storage.entries("other") == []
+
+    def test_the_same_entry_again_is_a_repeat(self):
+        made = manager(session_id="trip")
+        made.add(note("a"))
+        assert made.add(note("a")) is False
+        assert len(made.storage.entries("trip")) == 1
+
+    def test_a_different_entry_with_a_stored_id_is_refused(self):
+        made = manager(session_id="trip")
+        made.add(note("a"))
+        with pytest.raises(ValueError, match="another entry with id_ 'a'"):
+            made.add(note("a", text="something else"))
+
+    @pytest.mark.parametrize(
+        "payload", [Summary(text="Earlier: trip planning."), Notes(sections={"budget": 3000}), Pin(entry_id="a")]
+    )
+    def test_summary_notes_and_pin_entries_are_refused(self, payload):
+        made = manager(session_id="trip")
+        with pytest.raises(ValueError, match="come from the manager, not from add"):
+            made.add(Entry.of(payload))
+        assert made.storage.entries("trip") == []
+
+    def test_only_an_entry_can_be_added(self):
+        with pytest.raises(TypeError, match="add takes an Entry, not a Context"):
+            manager().add(Context(text="a"))  # type: ignore[arg-type]
 
 
-class TestRepeatedAdd:
-    def test_adding_the_same_entry_again_does_nothing(self):
-        dump = InMemoryStorage()
-        entry = ContextEntry(text="a")
-        manager = managed([entry, *notes("b")], dump_storage=dump, dump_every=3)
-        manager.add(entry)
-        assert texts(manager.entries) == ["a", "b"] and texts(manager.window) == ["a", "b"]
-        manager.add(ContextEntry(text="c"))  # the third add: the repeat was not counted
-        assert texts(dump.entries(manager.session_id)) == ["a", "b", "c"]
 
-    def test_a_response_repeats_without_its_raw_payload_counting(self):
-        reply = answer("r1")
-        manager = managed([UserPrompt(text="q1"), reply])
-        manager.add(reply.model_copy(update={"raw": {"provider": "payload"}}))
-        assert len(manager.entries) == 2
-
-    def test_a_repeat_after_a_restart_does_nothing(self):
-        storage = InMemoryStorage()
-        photo = UserPrompt(text="b", images=[Image(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")])
-        ShortTermMemoryManager(storage, session_id="s1").add(photo)
-        ShortTermMemoryManager(storage, session_id="s1").add(photo)
-        assert len(storage.entries("s1")) == 1
-
-    @pytest.mark.parametrize("make", [lambda path: SQLiteStorage(":memory:"), lambda path: FileStorage(path / "h.jsonl")])
-    def test_a_repeat_is_recognized_after_a_round_trip_through_storage(self, make, tmp_path):
-        storage = make(tmp_path)
-        entries = [UserPrompt(text="q", images=[Image(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")]), answer("r")]
-        manager = ShortTermMemoryManager(storage, session_id="s1")
-        for entry in entries:
-            manager.add(entry)
-        for entry in entries:
-            manager.add(entry)
-        assert len(storage.entries("s1")) == 2
-
-    def test_a_rewound_entry_added_again_is_still_refused(self):
-        manager = managed(notes("a", "b"))
-        a, b = manager.entries
-        manager.rewind(a.id_)
-        with pytest.raises(ValueError, match="already in the session"):
-            manager.add(b)
+def summary(text):
+    return Entry.of(Summary(text=text))
 
 
-class TestDump:
-    def test_dumps_the_entries_and_keeps_the_primary(self):
-        dump = InMemoryStorage()
-        manager = ShortTermMemoryManager(InMemoryStorage(), dump_storage=dump)
-        for entry in notes("a", "b"):
-            manager.add(entry)
-        assert texts(manager.dump()) == ["a", "b"]
-        assert texts(dump.entries(manager.session_id)) == ["a", "b"]
-        assert texts(manager.entries) == ["a", "b"]
-
-    def test_dumping_again_appends_only_the_new_entries(self):
-        dump = InMemoryStorage()
-        manager = ShortTermMemoryManager(InMemoryStorage(), dump_storage=dump)
-        manager.add(ContextEntry(text="a"))
-        manager.dump()
-        manager.add(ContextEntry(text="b"))
-        assert texts(manager.dump()) == ["b"]
-        assert manager.dump() == []
-        assert texts(dump.entries(manager.session_id)) == ["a", "b"]
-
-    def test_a_continued_session_does_not_dump_twice(self, tmp_path):
-        primary = InMemoryStorage()
-        dump_path = tmp_path / "dump.jsonl"
-        first = ShortTermMemoryManager(primary, dump_storage=FileStorage(dump_path), session_id="s1")
-        first.add(ContextEntry(text="a"))
-        first.dump()
-        again = ShortTermMemoryManager(primary, dump_storage=FileStorage(dump_path, exist_ok=True), session_id="s1")
-        again.add(ContextEntry(text="b"))
-        assert texts(again.dump()) == ["b"]
-        assert texts(FileStorage(dump_path, exist_ok=True).entries("s1")) == ["a", "b"]
-
-    def test_sessions_sharing_a_dump_stay_apart(self):
-        primary, dump = InMemoryStorage(), InMemoryStorage()
-        one = ShortTermMemoryManager(primary, dump_storage=dump, session_id="s1")
-        two = ShortTermMemoryManager(primary, dump_storage=dump, session_id="s2")
-        one.add(ContextEntry(text="a"))
-        two.add(ContextEntry(text="b"))
-        one.dump()
-        two.dump()
-        assert texts(dump.entries("s1")) == ["a"] and texts(dump.entries("s2")) == ["b"]
-
-    def test_needs_a_dump_storage(self):
-        with pytest.raises(ValueError, match="no dump_storage"):
-            ShortTermMemoryManager(InMemoryStorage()).dump()
-
-
-class TestActiveWindow:
-    def test_a_new_session_starts_empty_and_every_added_entry_joins(self):
-        manager = ShortTermMemoryManager(InMemoryStorage())
-        assert manager.active == []
-        for entry in notes("a", "b"):
-            manager.add(entry)
-        assert texts(manager.active) == ["a", "b"]
-
-    def test_holds_ids_and_reads_the_entries_from_the_primary(self):
-        storage = InMemoryStorage()
-        manager = ShortTermMemoryManager(storage, session_id="s1")
-        manager.add(ContextEntry(text="a"))
-        storage.add("s1", ContextEntry(text="written behind the manager's back"))
-        assert texts(manager.active) == ["a"]  # the window is the manager's IDs, not the whole primary
-
-    def test_a_continued_session_starts_with_its_stored_entries(self):
-        storage = InMemoryStorage()
-        ShortTermMemoryManager(storage, session_id="s1").add(ContextEntry(text="a"))
-        again = ShortTermMemoryManager(storage, session_id="s1")
-        again.add(ContextEntry(text="b"))
-        assert texts(again.active) == ["a", "b"]
-
-    def test_a_returned_list_cannot_change_the_window(self):
-        manager = managed(notes("a"))
-        manager.active.clear()
-        assert texts(manager.active) == ["a"]
-
-    def test_a_rejected_duplicate_does_not_join(self):
-        entry = ContextEntry(text="a")
-        manager = managed([entry])
-        with pytest.raises(ValueError):
-            manager.add(ContextEntry(id_=entry.id_, text="other"))
-        assert texts(manager.active) == ["a"]
-
-    def test_dumping_leaves_the_window_as_it_is(self):
-        manager = managed(notes("a", "b"), dump_storage=InMemoryStorage())
-        manager.dump()
-        assert texts(manager.active) == ["a", "b"]
+def notes(destination):
+    return Entry.of(Notes(sections={"destination": destination}))
 
 
 def ids(entries):
     return [entry.id_ for entry in entries]
 
 
-def answer(name, calls=()):
-    messages = [ResponseMessage(id=call, role="assistant", content=ToolCallContent(
-        data=ToolCall(name="search", arguments={}, status="complete", raw=None))) for call in calls]
-    return LLMResponse(text=name, messages=messages, provider="openai", id_=f"resp-{name}", model="m",
-                       created_at=datetime(2026, 1, 1, tzinfo=timezone.utc), status="completed")
+def opened(*stored, policy=None):
+    """A manager opened on session "trip" of a storage already holding ``stored``; it reads them when it starts.
+    """
+    storage = InMemoryStorage()
+    for entry in stored:
+        storage.add("trip", entry)
+    return ShortTermMemoryManager(storage, session_id="trip", policy=policy)
 
 
-def result(call):
-    return ToolResultEntry(message_id=call, name="search", arguments={}, output="found")
+class CountingStorage(InMemoryStorage):
+    """Counts the reads that go through the whole session: ``index`` and ``entries``."""
+
+    whole_reads = 0
+
+    def index(self, session_id):
+        self.whole_reads += 1
+        return super().index(session_id)
+
+    def entries(self, session_id):
+        self.whole_reads += 1
+        return super().entries(session_id)
 
 
+class TestReads:
+    def test_a_new_session_reads_empty(self):
+        made = manager()
+        assert (made.entries, made.window, made.pinned, made.active) == ([], [], [], [])
+        assert (made.summary, made.notes) == (None, None)
 
-def conversation():
-    """System prompts, questions, answers, tool calls with results, context: every pair to repair."""
-    return [
-        SystemPrompt(text="s1"), UserPrompt(text="q1"), answer("r1"), ContextEntry(text="c1"),
-        UserPrompt(text="q2"), answer("r2", calls=["m1", "m2"]), result("m1"), result("m2"), answer("r2b"),
-        ContextEntry(text="c2"), SystemPrompt(text="s2"), UserPrompt(text="q3"), answer("r3", calls=["m3"]),
-        result("m3"), UserPrompt(text="q4"), answer("r4"), ContextEntry(text="c3"), UserPrompt(text="q5"),
-        answer("r5", calls=["m4"]), result("m4"), answer("r5b"), UserPrompt(text="q6"), answer("r6"),
-    ]
+    def test_the_history_is_what_was_added_without_summaries_and_notes(self):
+        made = opened(note("a"), summary("Earlier: a."), note("b"), notes("Kyoto"))
+        assert ids(made.entries) == ["a", "b"]
 
+    def test_without_a_policy_the_window_is_the_whole_history(self):
+        made = manager()
+        for name in "abc":
+            made.add(note(name))
+        assert ids(made.window) == ["a", "b", "c"]
 
-POLICIES = {
-    "full": lambda: FullPolicy(),
-    **{f"last-{n}": (lambda n=n: LastNPolicy(n)) for n in (1, 2, 3, 4, 5, 7)},
-    "sliding-4-2": lambda: SlidingWindowPolicy(4, 2),
-    "sliding-6-3": lambda: SlidingWindowPolicy(6, 3),
-    "sliding-5-1": lambda: SlidingWindowPolicy(5, 1),
-    "no-context": lambda: TypeFilterPolicy(exclude=[ContextEntry]),
-    "no-results": lambda: TypeFilterPolicy(exclude=[ToolResultEntry]),
-    "no-questions": lambda: TypeFilterPolicy(exclude=[UserPrompt]),
-    "filter-then-last": lambda: ChainPolicy([TypeFilterPolicy(exclude=[ContextEntry]), LastNPolicy(3)]),
-    "filter-then-sliding": lambda: ChainPolicy([TypeFilterPolicy(exclude=[ContextEntry]), SlidingWindowPolicy(4, 2)]),
-    # Written window first: the chain runs the filter first anyway, so no drift.
-    "sliding-then-filter": lambda: ChainPolicy([SlidingWindowPolicy(6, 3), TypeFilterPolicy(exclude=[ContextEntry])]),
-    "head-tail-2-3": lambda: HeadTailPolicy(2, 3),
-    "short-only": lambda: PredicateFilterPolicy(lambda entry: len(entry.to_text()) < 40),
-    "short-then-head-tail": lambda: ChainPolicy([PredicateFilterPolicy(lambda entry: len(entry.to_text()) < 40),
-                                                 HeadTailPolicy(1, 3)]),
-    "tokens-12-6": lambda: TokenWindowPolicy(12, 6),
-    "filter-then-tokens": lambda: ChainPolicy([TypeFilterPolicy(exclude=[ContextEntry]), TokenWindowPolicy(10, 4)]),
-    "last-then-filter": lambda: ChainPolicy([LastNPolicy(3), TypeFilterPolicy(exclude=[ContextEntry])]),
-}
+    def test_with_a_policy_the_window_is_its_choice(self):
+        made = manager(policy=PredicateFilterPolicy(lambda entry: entry.id_ != "c").then(LastNPolicy(2)))
+        for name in "abcd":
+            made.add(note(name))
+        assert ids(made.window) == ["b", "d"]
 
+    def test_the_summary_and_the_notes_are_the_latest_ones(self):
+        first, second, paris, kyoto = summary("first"), summary("second"), notes("Paris"), notes("Kyoto")
+        made = opened(first, paris, second, kyoto)
+        assert (made.summary, made.notes) == (second, kyoto)
 
-class TestPolicyWindow:
-    @pytest.mark.parametrize("name", POLICIES)
-    def test_after_every_add_the_same_as_choosing_from_the_whole_history(self, name):
-        # Without system prompts nothing is pinned, so the window is the policy's choice alone.
-        manager, policy, added = ShortTermMemoryManager(InMemoryStorage(), policy=POLICIES[name]()), POLICIES[name](), []
-        for entry in [e for e in conversation() if not isinstance(e, SystemPrompt)]:
-            manager.add(entry)
-            added.append(entry)
-            # The reference: the policy's choice from everything added so far.
-            assert ids(manager.active) == ids(policy.select(added)), f"after adding {entry.to_text()!r}"
+    def test_active_is_the_summary_the_notes_the_pinned_then_the_window(self):
+        earlier, kyoto = summary("Earlier: a."), notes("Kyoto")
+        made = opened(note("a"), earlier, kyoto, note("b"), policy=LastNPolicy(1))
+        made.add(note("rule"), pinned=True)
+        made.add(note("c"))
+        assert ids(made.active) == [earlier.id_, kyoto.id_, "rule", "c"]
 
-    def test_the_default_policy_keeps_everything(self):
-        manager = managed(notes("a", "b", "c"))
-        assert isinstance(manager.policy, FullPolicy) and texts(manager.active) == ["a", "b", "c"]
+    def test_only_what_exists_leads_active(self):
+        kyoto = notes("Kyoto")
+        assert ids(opened(note("a"), kyoto).active) == [kyoto.id_, "a"]
 
-    def test_pairs_are_not_repaired_the_window_is_the_policys_choice(self):
-        q, r, done = UserPrompt(text="q"), answer("r", calls=["c1"]), result("c1")
-        manager = managed([q, r, done, *notes("a")], policy=LastNPolicy(2))
-        assert ids(manager.active) == [done.id_, manager.entries[-1].id_]  # the result, without its call
+    def test_a_manager_on_a_stored_session_reads_it(self):
+        storage = InMemoryStorage()
+        ShortTermMemoryManager(storage, session_id="trip").add(note("a"))
+        assert ids(ShortTermMemoryManager(storage, session_id="trip").entries) == ["a"]
 
-    def test_replacing_the_policy_chooses_again_from_the_whole_history(self):
-        manager = managed(notes("a", "b", "c", "d"), policy=LastNPolicy(1))
-        manager.policy = LastNPolicy(3)  # entries that left the window come back
-        assert texts(manager.active) == ["b", "c", "d"]
-
-    def test_a_continued_session_chooses_its_window_from_the_stored_entries(self, tmp_path):
-        storage = SQLiteStorage(tmp_path / "history.db")
-        first = ShortTermMemoryManager(storage, session_id="s1")
-        for entry in notes("a", "b", "c"):
-            first.add(entry)
-        again = ShortTermMemoryManager(storage, policy=LastNPolicy(2), session_id="s1")
-        assert texts(again.active) == ["b", "c"]
-        again.add(ContextEntry(text="d"))
-        assert texts(again.active) == ["c", "d"]
-        storage.close()
+    def test_reads_do_not_go_through_the_whole_session(self):
+        storage, earlier, kyoto = CountingStorage(), summary("Earlier."), notes("Kyoto")
+        for entry in (note("a"), earlier, kyoto, note("b"), note("c")):
+            storage.add("trip", entry)
+        made = ShortTermMemoryManager(storage, session_id="trip", policy=LastNPolicy(2))
+        storage.whole_reads = 0
+        for _ in range(3):
+            assert (made.summary, made.notes, made.pinned) == (earlier, kyoto, [])
+            assert ids(made.active) == [earlier.id_, kyoto.id_, "b", "c"]
+        assert storage.whole_reads == 0
 
 
 class TestPinning:
-    def test_a_pinned_entry_stays_in_its_place_and_does_not_count_toward_the_window(self):
-        manager = managed(notes("a", "b", "c"), policy=LastNPolicy(2))
-        manager.pin(manager.entries[1].id_)  # b
-        for entry in notes("d", "e"):
-            manager.add(entry)
-        assert texts(manager.active) == ["b", "d", "e"]  # two chosen by the policy, plus b, still first
-        assert texts(manager.pinned) == ["b"]
+    def test_a_pin_record_is_stored_right_after_the_entry(self):
+        made = manager(session_id="trip")
+        made.add(note("rule"), pinned=True)
+        rule, record = made.storage.entries("trip")
+        assert rule.id_ == "rule" and record.payload == Pin(entry_id="rule")
+        assert ids(made.entries) == ["rule"]
+
+    def test_a_pinned_entry_stays_in_active_after_the_window_leaves_it(self):
+        made = manager(policy=LastNPolicy(1))
+        made.add(note("rule"), pinned=True)
+        for name in "abc":
+            made.add(note(name))
+        assert ids(made.pinned) == ["rule"]
+        assert ids(made.window) == ["c"]
+        assert ids(made.active) == ["rule", "c"]
+
+    def test_a_pinned_entry_takes_no_place_in_the_window(self):
+        made = manager(policy=LastNPolicy(2))
+        made.add(note("a"))
+        made.add(note("rule"), pinned=True)
+        made.add(note("b"))
+        assert ids(made.window) == ["a", "b"]
+
+    def test_a_filter_does_not_hide_a_pinned_entry(self):
+        made = manager(policy=PredicateFilterPolicy(lambda entry: entry.id_ != "rule"))
+        made.add(note("rule"), pinned=True)
+        assert ids(made.active) == ["rule"]
+
+    def test_pinned_entries_are_oldest_first_and_still_in_the_history(self):
+        made = manager()
+        made.add(note("first"), pinned=True)
+        made.add(note("a"))
+        made.add(note("second"), pinned=True)
+        assert ids(made.pinned) == ["first", "second"]
+        assert ids(made.entries) == ["first", "a", "second"]
+
+    def test_a_repeat_does_not_pin(self):
+        made = manager()
+        made.add(note("a"))
+        assert made.add(note("a"), pinned=True) is False
+        assert made.pinned == []
+
+
+def archived(archive, session_id="trip"):
+    return ids(archive.entries(session_id))
+
+
+class TestDump:
+    def test_without_a_dump_storage_dump_is_refused(self):
+        with pytest.raises(ValueError, match="no dump_storage"):
+            manager().dump()
+
+    def test_the_entries_are_copied_in_order_under_the_same_session(self):
+        archive = InMemoryStorage()
+        made = manager(session_id="trip", dump_storage=archive)
+        made.add(note("a"))
+        made.add(note("b"))
+        assert ids(made.dump()) == ["a", "b"]
+        assert archived(archive) == ["a", "b"]
+        assert ids(made.storage.entries("trip")) == ["a", "b"]  # the session's storage is left as it is
+
+    def test_a_dump_copies_only_what_is_new(self):
+        archive = InMemoryStorage()
+        made = manager(session_id="trip", dump_storage=archive)
+        made.add(note("a"))
+        made.dump()
+        made.add(note("b"))
+        assert ids(made.dump()) == ["b"]
+        assert made.dump() == []
+        assert archived(archive) == ["a", "b"]
+
+    def test_everything_stored_is_copied_summaries_notes_and_pins_too(self):
+        storage, archive = InMemoryStorage(), InMemoryStorage()
+        earlier, kyoto = summary("Earlier."), notes("Kyoto")
+        for entry in (note("a"), earlier, kyoto):
+            storage.add("trip", entry)
+        made = ShortTermMemoryManager(storage, session_id="trip", dump_storage=archive)
+        made.add(note("rule"), pinned=True)
+        made.dump()
+        assert archive.entries("trip") == made.storage.entries("trip")
+        assert [entry.kind.value for entry in archive.entries("trip")] == ["context", "summary", "notes", "context", "pin"]
+
+    def test_every_n_adds_the_new_entries_are_dumped(self):
+        archive = InMemoryStorage()
+        made = manager(session_id="trip", dump_storage=archive, dump_every=2)
+        made.add(note("a"))
+        assert archived(archive) == []
+        made.add(note("b"))
+        assert archived(archive) == ["a", "b"]
+        made.add(note("c"))
+        assert archived(archive) == ["a", "b"]
+        made.add(note("d"))
+        assert archived(archive) == ["a", "b", "c", "d"]
+
+    def test_a_dump_on_demand_starts_the_count_again(self):
+        archive = InMemoryStorage()
+        made = manager(session_id="trip", dump_storage=archive, dump_every=2)
+        made.add(note("a"))
+        made.dump()
+        made.add(note("b"))
+        assert archived(archive) == ["a"]
+        made.add(note("c"))
+        assert archived(archive) == ["a", "b", "c"]
 
-    def test_unpinning_removes_nothing_until_the_next_add(self):
-        manager = managed(notes("a", "b", "c"), policy=LastNPolicy(2))
-        b = manager.entries[1].id_
-        manager.pin(b)
-        manager.add(ContextEntry(text="d"))
-        manager.unpin(b)
-        assert texts(manager.active) == ["b", "c", "d"]
-        manager.add(ContextEntry(text="e"))
-        assert texts(manager.active) == ["d", "e"]
+    def test_a_repeat_is_not_an_add(self):
+        archive = InMemoryStorage()
+        made = manager(session_id="trip", dump_storage=archive, dump_every=2)
+        made.add(note("a"))
+        made.add(note("a"))
+        assert archived(archive) == []
 
-    def test_only_an_active_entry_can_be_pinned(self):
-        manager = managed(notes("a", "b"), policy=LastNPolicy(1))
-        with pytest.raises(ValueError, match="not in the window"):
-            manager.pin(manager.entries[0].id_)
 
-    def test_pin_and_unpin_take_an_id(self):
-        manager = managed(notes("a"))
-        with pytest.raises(TypeError, match="entry_id must be a string"):
-            manager.pin(manager.entries[0])
+class TripNotes(BaseModel):
+    destination: str | None = None
+    budget: int | None = None
+    constraints: list[str] = Field(default_factory=list)
+    next_step: str | None = Field(default=None, alias="next")
 
-    def test_the_system_prompt_is_pinned(self):
-        manager = managed([SystemPrompt(text="sys"), *notes("a", "b", "c")], policy=LastNPolicy(2))
-        assert texts(manager.active) == ["sys", "b", "c"] and texts(manager.pinned) == ["sys"]
 
-    def test_a_new_system_prompt_takes_the_pin_and_the_old_one_leaves_when_the_policy_drops_it(self):
-        manager = managed([SystemPrompt(text="s1"), *notes("a", "b", "c")], policy=LastNPolicy(2))
-        manager.add(SystemPrompt(text="s2"))
-        assert texts(manager.active) == ["s1", "b", "c", "s2"]  # s1 unpinned, but still active
-        assert texts(manager.pinned) == ["s2"]
-        manager.add(ContextEntry(text="d"))
-        assert texts(manager.active) == ["c", "s2", "d"]  # the policy dropped s1; s2 keeps its place
-        manager.add(ContextEntry(text="e"))
-        assert texts(manager.active) == ["s2", "d", "e"]  # everything older left: s2 is first
+EMPTY = {"destination": None, "budget": None, "constraints": [], "next_step": None}
 
-    def test_an_old_system_prompt_that_left_never_comes_back(self):
-        storage = InMemoryStorage()
-        manager = ShortTermMemoryManager(storage, compaction=RollingCompaction(FakeSummarizer()), session_id="s1")
-        for entry in [SystemPrompt(text="s1"), *notes("a"), SystemPrompt(text="s2"), *notes("b")]:
-            manager.add(entry)
-        manager.compact()  # a and b go into the summary; s1 just leaves (not summarized)
-        assert texts(manager.window) == ["s2"]
-        manager.policy = FullPolicy()  # the window is chosen again from the whole history
-        assert texts(manager.window) == ["s2"]
-        assert texts(ShortTermMemoryManager(storage, session_id="s1").window) == ["s2"]  # and on resume
 
-    def test_choosing_again_considers_only_the_latest_system_prompt(self):
-        storage = InMemoryStorage()
-        manager = ShortTermMemoryManager(storage, session_id="s1")  # FullPolicy: s1 stays in the window
-        for entry in [SystemPrompt(text="s1"), *notes("a"), SystemPrompt(text="s2"), *notes("b")]:
-            manager.add(entry)
-        assert texts(manager.active) == ["s1", "a", "s2", "b"]
-        assert texts(ShortTermMemoryManager(storage, session_id="s1").active) == ["a", "s2", "b"]  # a resume leaves s1 out
-        manager.policy = FullPolicy()
-        assert texts(manager.active) == ["a", "s2", "b"]  # so does a new policy
-
-    def test_a_sliding_window_still_jumps_by_step_around_a_pinned_system_prompt(self):
-        policy = SlidingWindowPolicy(4, 2)
-        manager = managed([SystemPrompt(text="sys")], policy=SlidingWindowPolicy(4, 2))
-        added = []
-        for entry in notes(*"abcdefghij"):
-            manager.add(entry)
-            added.append(entry)
-            assert texts(manager.active) == ["sys", *texts(policy.select(added))]
-
-    def test_system_prompts_are_pinned_by_rule_only(self):
-        manager = managed([SystemPrompt(text="s1"), *notes("a"), SystemPrompt(text="s2")])
-        old, new = manager.entries[0].id_, manager.entries[2].id_
-        with pytest.raises(ValueError, match="pinned by rule"):
-            manager.pin(old)
-        with pytest.raises(ValueError, match="stay pinned"):
-            manager.unpin(new)
-
-    def test_replacing_the_policy_keeps_the_pins(self):
-        manager = managed(notes("a", "b", "c"))
-        manager.pin(manager.entries[0].id_)
-        manager.policy = LastNPolicy(1)
-        assert texts(manager.active) == ["a", "c"]
-
-    def test_a_continued_session_pins_its_latest_system_prompt_again(self):
-        storage = InMemoryStorage()
-        first = ShortTermMemoryManager(storage, session_id="s1")
-        for entry in [SystemPrompt(text="s1"), *notes("a"), SystemPrompt(text="s2"), *notes("b", "c")]:
-            first.add(entry)
-        again = ShortTermMemoryManager(storage, policy=LastNPolicy(1), session_id="s1")
-        assert texts(again.active) == ["s2", "c"] and texts(again.pinned) == ["s2"]
-
-
-def compacting(entries, summarizer=None, kind=RollingCompaction, **settings):
-    """A manager with a compaction over a FakeSummarizer ('summary #N of <texts>'), with ``entries`` added."""
-    return managed(entries, compaction=kind(summarizer or FakeSummarizer()), **settings)
-
-
-class FlakySummarizer(FakeSummarizer):
-    """Fails while ``failing`` is true, like a cut-off response or an API error."""
-
-    failing = True
-
-    def summarize(self, entries, previous=None):
-        if self.failing:
-            raise ValueError("the summary response is 'incomplete', not 'completed'")
-        return super().summarize(entries, previous)
-
-
-class TextSummarizer(FakeSummarizer):
-    """Like FakeSummarizer, but labels any entry, a tool result too, by its ``to_text()``."""
-
-    def summarize(self, entries, previous=None):
-        return super().summarize([ContextEntry(text=entry.to_text()) for entry in entries], previous)
-
-
-class TestCompaction:
-    def test_what_leaves_the_window_is_summarized_in_the_same_add(self):
-        summarizer = FakeSummarizer()
-        manager = compacting(notes("a", "b", "c"), summarizer, policy=LastNPolicy(2))
-        assert summarizer.calls == [(["a"], None)]
-        assert texts(manager.active) == ["summary #1 of a", "b", "c"]
-        manager.add(ContextEntry(text="d"))
-        assert summarizer.calls[-1] == (["b"], "summary #1 of a")  # the current summary and only the new drop
-        assert texts(manager.active) == ["summary #2 of b", "c", "d"]
-        assert len(manager.entries) == 6  # nothing removed from the primary; each summary is added
-
-    def test_the_summary_covers_everything_that_left(self):
-        manager = compacting(notes("a", "b", "c", "d"), policy=LastNPolicy(2))
-        by_text = {entry.text: entry.id_ for entry in manager.entries if isinstance(entry, ContextEntry)}
-        assert covered(manager) == [by_text["a"], by_text["b"]]
-
-    def test_each_summary_is_one_version_after_the_previous(self):
-        manager = compacting(notes("a", "b", "c", "d"), policy=LastNPolicy(1))
-        assert [e.version for e in manager.entries if isinstance(e, SummaryEntry)] == [1, 2, 3]
-
-    def test_a_hybrid_compaction_rebuilds_every_n_versions_and_loads_the_originals_only_then(self):
-        summarizer, handed = FakeSummarizer(), []
-
-        class Recording(HybridCompaction):
-            """Records how many originals the manager handed over for each update."""
-
-            def compact(self, newly, previous, covered):
-                handed.append(len(covered))
-                return super().compact(newly, previous, covered)
-
-            async def compact_async(self, newly, previous, covered):
-                handed.append(len(covered))
-                return await super().compact_async(newly, previous, covered)
-
-        manager = managed(notes("a", "b", "c", "d", "e"), policy=LastNPolicy(1),
-                          compaction=Recording(summarizer, rebuild_every=2))
-        assert summarizer.calls == [
-            (["a"], None),                      # v1: rolls
-            (["a", "b"], None),                 # v2: rebuilt from the originals
-            (["c"], "summary #2 of a b"),       # v3: rolls
-            (["a", "b", "c", "d"], None),       # v4: rebuilt
-        ]
-        assert handed == [0, 1, 0, 3]  # the originals are loaded on the rebuilds only
-        assert manager.summary.version == 4
-
-    def test_a_continued_session_keeps_the_hybrid_rhythm(self):
-        storage, summarizer = InMemoryStorage(), FakeSummarizer()
-
-        def opened():
-            return ShortTermMemoryManager(storage, policy=LastNPolicy(1), session_id="s1",
-                                          compaction=HybridCompaction(summarizer, rebuild_every=2))
-
-        first = opened()
-        for entry in notes("a", "b", "c"):
-            first.add(entry)  # v1 rolls, v2 rebuilt
-        again = opened()
-        for entry in notes("d", "e"):
-            again.add(entry)  # v3 rolls, v4 rebuilt
-        assert summarizer.calls[2:] == [(["c"], "summary #2 of a b"), (["a", "b", "c", "d"], None)]
-
-    def test_a_sliding_window_gives_one_summary_per_jump(self):
-        summarizer = FakeSummarizer()
-        compacting(notes(*"abcdefgh"), summarizer, policy=SlidingWindowPolicy(4, 2))
-        assert summarizer.calls == [(["a", "b"], None), (["c", "d"], "summary #1 of a b")]
-
-    @pytest.mark.parametrize("name", POLICIES)
-    def test_every_entry_is_in_the_window_the_summary_or_excluded_by_a_filter(self, name):
-        policy = POLICIES[name]()
-        manager = ShortTermMemoryManager(InMemoryStorage(), policy=policy, compaction=RollingCompaction(TextSummarizer()))
-        for entry in [e for e in conversation() if not isinstance(e, SystemPrompt)]:
-            manager.add(entry)
-            added = [e for e in manager.entries if not isinstance(e, SummaryEntry)]
-            excluded = {e.id_ for e in added} - {e.id_ for e in filters_keep(policy, added)}
-            summarized = set(covered(manager))
-            window = {e.id_ for e in manager.active if not isinstance(e, SummaryEntry)}
-            assert window | summarized | excluded == {e.id_ for e in added}
-            assert not window & summarized and not window & excluded and not summarized & excluded
-
-    def test_the_summary_lists_only_what_it_skips_however_long_the_history(self):
-        manager = compacting([SystemPrompt(text="S"), *notes(*map(str, range(100)))], policy=SlidingWindowPolicy(10, 5))
-        system = manager.entries[0]
-        assert manager.summary.covers_except == [system.id_]  # the system prompt, still in the window
-        assert manager.summary.covers_count == len(covered(manager)) > 80
-
-    def test_a_pinned_entry_is_an_exception_until_it_leaves(self):
-        manager = compacting(notes("a", "b"), policy=LastNPolicy(1))
-        b = manager.entries[1]
-        manager.pin(b.id_)
-        for entry in notes("c", "d"):
-            manager.add(entry)
-        by_id = {entry.id_: entry for entry in manager.entries}
-        assert manager.summary.covers_except == [b.id_]
-        assert texts(by_id[i] for i in covered(manager)) == ["a", "c"]
-        manager.unpin(b.id_)
-        manager.add(ContextEntry(text="e"))
-        by_id = {entry.id_: entry for entry in manager.entries}
-        assert manager.summary.covers_except == []
-        assert texts(by_id[i] for i in covered(manager)) == ["a", "b", "c", "d"]
-
-    def test_without_a_compaction_what_leaves_is_forgotten(self):
-        manager = managed(notes("a", "b", "c"), policy=LastNPolicy(2))
-        assert manager.summary is None and texts(manager.active) == ["b", "c"]
-
-    def test_the_summary_is_first_even_before_the_pinned_system_prompt(self):
-        manager = compacting([SystemPrompt(text="S"), *notes("a", "b")], policy=LastNPolicy(1))
-        assert texts(manager.active) == ["summary #1 of a", "S", "b"]
-        assert texts(manager.pinned) == ["summary #1 of a", "S"]
-
-    def test_pinned_entries_are_never_summarized(self):
-        summarizer = FakeSummarizer()
-        manager = compacting(notes("a", "b"), summarizer, policy=LastNPolicy(2))
-        manager.pin(manager.entries[0].id_)  # a
-        for entry in notes("c", "d"):
-            manager.add(entry)
-        assert [call[0] for call in summarizer.calls] == [["b"]]
-        assert texts(manager.active) == ["summary #1 of b", "a", "c", "d"]
-
-    def test_an_old_system_prompt_is_not_summarized(self):
-        summarizer = FakeSummarizer()
-        compacting([SystemPrompt(text="S1"), *notes("a"), SystemPrompt(text="S2"), *notes("b", "c")],
-                   summarizer, policy=LastNPolicy(1))
-        assert [call[0] for call in summarizer.calls] == [["a"], ["b"]]
-
-    def test_entries_a_filter_excludes_are_forgotten_not_summarized(self):
-        summarizer = FakeSummarizer()
-        manager = compacting([*notes("a"), UserPrompt(text="q")], summarizer,
-                             policy=TypeFilterPolicy(exclude=[ContextEntry]))
-        assert summarizer.calls == [] and manager.summary is None and texts(manager.active) == ["q"]
-
-    def test_in_a_chain_the_window_drops_are_summarized_and_the_filter_drops_are_not(self):
-        summarizer = FakeSummarizer()
-        entries = [UserPrompt(text="q1"), *notes("c1"), UserPrompt(text="q2"), UserPrompt(text="q3")]
-        compacting(entries, summarizer, policy=ChainPolicy([LastNPolicy(2), TypeFilterPolicy(exclude=[ContextEntry])]))
-        assert summarizer.calls == [(["q1"], None)]  # c1 was excluded, q1 left the window
-
-    def test_a_rebuild_resends_the_originals(self):
-        summarizer = FakeSummarizer()
-        compacting(notes("a", "b", "c"), summarizer, kind=RebuildCompaction, policy=LastNPolicy(1))
-        assert summarizer.calls[-1] == (["a", "b"], None)
-
-    def test_if_summarizing_fails_nothing_leaves_and_the_next_add_retries(self):
-        summarizer = FlakySummarizer()
-        manager = compacting(notes("a", "b"), summarizer, policy=LastNPolicy(2))
-        with pytest.raises(ValueError, match="incomplete"):
-            manager.add(ContextEntry(text="c"))
-        assert texts(manager.active) == ["a", "b", "c"] and manager.summary is None
-        summarizer.failing = False
-        manager.add(ContextEntry(text="d"))
-        assert summarizer.calls == [(["a", "b"], None)]
-        assert texts(manager.active) == ["summary #1 of a b", "c", "d"]
-
-    def test_a_smaller_policy_summarizes_what_it_leaves_out_and_a_larger_one_never_brings_back_the_summarized(self):
-        summarizer = FakeSummarizer()
-        manager = compacting(notes("a", "b", "c", "d"), summarizer)  # FullPolicy: nothing summarized yet
-        manager.policy = LastNPolicy(1)
-        assert summarizer.calls == [(["a", "b", "c"], None)] and texts(manager.active) == ["summary #1 of a b c", "d"]
-        manager.policy = FullPolicy()
-        assert texts(manager.active) == ["summary #1 of a b c", "d"]
-
-    def test_a_continued_session_restores_the_summary_and_the_window(self, tmp_path):
-        storage = SQLiteStorage(tmp_path / "history.db")
-        first = ShortTermMemoryManager(storage, policy=LastNPolicy(2), compaction=RollingCompaction(FakeSummarizer()),
-                              session_id="s1")
-        for entry in [SystemPrompt(text="S"), *notes("a", "b", "c")]:
-            first.add(entry)
-        again = ShortTermMemoryManager(storage, policy=LastNPolicy(2), session_id="s1")
-        assert texts(again.active) == ["summary #1 of a", "S", "b", "c"]
-        storage.close()
-
-    def test_a_session_resumed_with_a_compaction_summarizes_what_was_never_summarized(self):
-        storage = InMemoryStorage()
-        for entry in notes("a", "b", "c"):
-            storage.add("s1", entry)
-        summarizer = FakeSummarizer()
-        manager = ShortTermMemoryManager(storage, policy=LastNPolicy(1), compaction=RollingCompaction(summarizer), session_id="s1")
-        assert summarizer.calls == [(["a", "b"], None)] and texts(manager.active) == ["summary #1 of a b", "c"]
-
-    def test_refused(self):
-        manager = compacting(notes("a", "b"), policy=LastNPolicy(1))
-        with pytest.raises(ValueError, match="summaries come from compaction"):
-            manager.add(SummaryEntry(text="s", covers_through="x", covers_count=1))
-        with pytest.raises(ValueError, match="pinned by rule"):
-            manager.pin(manager.summary.id_)
-        with pytest.raises(ValueError, match="stay pinned"):
-            manager.unpin(manager.summary.id_)
-
-
-def size(*entries):
-    """The tokens of ``entries`` as ``count_words`` counts them: the words of each one's ``to_text()``."""
-    return sum(len(entry.to_text().split()) for entry in entries)
-
-
-class TestCompactOnDemand:
-    def test_without_a_budget_the_whole_unpinned_window_goes_to_the_summary(self):
-        summarizer = FakeSummarizer()
-        manager = compacting([SystemPrompt(text="S"), *notes("a", "b", "c")], summarizer)
-        update = manager.compact()
-        assert summarizer.calls == [(["a", "b", "c"], None)] and update.summary.id_ == manager.summary.id_
-        assert texts(manager.window) == ["S"] and texts(manager.active) == ["summary #1 of a b c", "S"]
-
-    def test_with_a_budget_the_newest_entries_that_fit_stay(self):
-        summarizer = FakeSummarizer()
-        manager = compacting(notes("a", "b", "c", "d"), summarizer)
-        a, b, c, d = manager.entries
-        manager.compact(max_tokens=size(c, d))
-        assert summarizer.calls == [(["a", "b"], None)] and covered(manager) == [a.id_, b.id_]
-        assert texts(manager.window) == ["c", "d"]
-
-    def test_it_stops_at_the_first_entry_that_does_not_fit(self):
-        summarizer = FakeSummarizer()
-        long = " ".join(["b"] * 20)
-        manager = compacting(notes("a", long, "c"), summarizer)
-        a, _, c = manager.entries
-        manager.compact(max_tokens=size(a, c))  # a and c would fit together, but the long one is between them
-        assert summarizer.calls == [(["a", long], None)] and texts(manager.window) == ["c"]
-
-    def test_pinned_entries_count_toward_the_budget_and_stay(self):
-        summarizer = FakeSummarizer()
-        manager = compacting(notes("a", "b", "c", "d"), summarizer)
-        a, _, _, d = manager.entries
-        manager.pin(a.id_)
-        manager.compact(max_tokens=size(a, d))
-        assert summarizer.calls == [(["b", "c"], None)] and texts(manager.window) == ["a", "d"]
-
-    def test_pinned_entries_alone_over_the_budget_change_nothing(self):
-        summarizer = FakeSummarizer()
-        manager = compacting([SystemPrompt(text="Be brief and kind."), *notes("a")], summarizer)
-        with pytest.raises(ValueError, match="pinned entries alone take 5 tokens, more than max_tokens=1"):
-            manager.compact(max_tokens=1)
-        assert summarizer.calls == [] and texts(manager.window) == ["Be brief and kind.", "a"]
-
-    def test_when_the_window_already_fits_nothing_is_summarized(self):
-        summarizer = FakeSummarizer()
-        manager = compacting(notes("a", "b"), summarizer)
-        assert manager.compact(max_tokens=size(*manager.entries)) is None
-        assert summarizer.calls == [] and texts(manager.window) == ["a", "b"]
-
-    def test_an_old_system_prompt_leaves_without_being_summarized(self):
-        summarizer = FakeSummarizer()
-        manager = compacting([SystemPrompt(text="S1"), *notes("a"), SystemPrompt(text="S2"), *notes("b")], summarizer)
-        manager.compact()
-        assert summarizer.calls == [(["a", "b"], None)] and texts(manager.window) == ["S2"]
-
-    def test_the_window_grows_again_and_the_summarized_never_come_back(self):
-        manager = compacting(notes("a", "b", "c"), policy=LastNPolicy(3))
-        manager.compact(max_tokens=size(manager.entries[2]))
-        manager.add(ContextEntry(text="d"))
-        assert texts(manager.active) == ["summary #1 of a b", "c", "d"]
-        manager.policy = FullPolicy()
-        assert texts(manager.active) == ["summary #1 of a b", "c", "d"]
-
-    def test_a_continued_session_keeps_what_was_compacted_out(self):
-        storage = InMemoryStorage()
-        first = ShortTermMemoryManager(storage, compaction=RollingCompaction(FakeSummarizer()), session_id="s1")
-        for entry in notes("a", "b", "c"):
-            first.add(entry)
-        first.compact(max_tokens=size(first.entries[2]))
-        assert texts(ShortTermMemoryManager(storage, session_id="s1").active) == ["summary #1 of a b", "c"]
-
-    def test_if_summarizing_fails_the_window_stays_as_it_was(self):
-        manager = compacting(notes("a", "b"), FlakySummarizer())
-        with pytest.raises(ValueError, match="incomplete"):
-            manager.compact()
-        assert texts(manager.window) == ["a", "b"] and manager.summary is None
-
-    @pytest.mark.parametrize("max_tokens", [-1, 1.5, True, "10"])
-    def test_max_tokens_must_be_a_non_negative_integer(self, max_tokens):
-        with pytest.raises(ValueError, match="max_tokens must be a non-negative integer"):
-            compacting(notes("a")).compact(max_tokens=max_tokens)
-
-    def test_refused(self):
-        with pytest.raises(ValueError, match="no compaction"):
-            managed(notes("a")).compact()
-        with pytest.raises(ValueError, match="unknown encoding"):
-            compacting(notes("a")).compact(encoding="nope")
-
-    def test_each_attached_image_adds_its_estimate(self):
-        summarizer = FakeSummarizer()
-        photo = UserPrompt(text="b", images=[Image(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")])
-        manager = compacting([*notes("a"), photo], summarizer)
-        both = size(*manager.entries) + MEDIA_TOKENS["image"]
-        assert manager.compact(max_tokens=both) is None  # both fit with the image's estimate
-        manager.compact(max_tokens=both - 1)
-        assert texts(manager.window) == ["b"] and summarizer.calls == [(["a"], None)]
-
-    def test_a_document_counts_as_its_estimate(self):
-        report = ContextEntry(text="report", documents=[Document(data=b"%PDF-1.4", mime_type="application/pdf", filename="r.pdf")])
-        manager = compacting([report])
-        manager.compact(max_tokens=size(report) + MEDIA_TOKENS["document"] - 1)
-        assert manager.window == [] and manager.summary is not None
-
-    def test_the_estimates_can_be_changed_or_left_out(self):
-        photo = UserPrompt(text="b", images=[Image(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")])
-        manager = compacting([photo])
-        assert manager.compact(max_tokens=size(photo), media_tokens={}) is None  # only the placeholder text
-        manager.compact(max_tokens=size(photo) + MEDIA_TOKENS["image"], media_tokens={"image": 1000})
-        assert manager.window == []
-
-    @pytest.mark.parametrize("media_tokens, message", [
-        ({"images": 1}, "media_tokens keys must be among"),
-        ({"image": -1}, "must be a non-negative integer"),
-        ({"audio": True}, "must be a non-negative integer"),
-        ({"document": 1.5}, "must be a non-negative integer"),
-    ])
-    def test_media_tokens_must_be_known_kinds_with_non_negative_integers(self, media_tokens, message):
-        manager = compacting(notes("a"))
-        with pytest.raises(ValueError, match=message):
-            manager.compact(media_tokens=media_tokens)
-        assert texts(manager.window) == ["a"]
-
-
-def noting(entries, *answers, **settings):
-    """A manager with an NoteTaker whose fake LLM answers ``answers`` in turn; returns it and the LLM."""
-    llm = FakeLLM(*answers)
-    return managed(entries, note_taker=NoteTaker(llm, schema=TripNotes), **settings), llm
-
-
-def sent(llm, call=-1):
-    """The conversation part of an update prompt: what the updater was given as new."""
-    return llm.calls[call]["user_prompt"].text.split("Conversation since the last update:\n")[1]
-
-
-class TestNotes:
-    def test_updated_once_notes_every_turns_finished_with_only_the_entries_since(self):
-        manager, llm = noting([UserPrompt(text="q1"), answer("a1"), *notes("c1"), UserPrompt(text="q2"), answer("a2")],
-                              notes_json(destination="Kyoto"), notes_json(destination="Tokyo"), notes_every=2)
-        assert len(llm.calls) == 1 and sent(llm) == "User: q1\n\nAssistant: a1\n\nContext:\nc1\n\nUser: q2\n\nAssistant: a2"
-        assert manager.notes == {"destination": "Kyoto", "constraints": [], "next_step": None}
-        for entry in [*notes("c2"), UserPrompt(text="q3"), answer("a3"), UserPrompt(text="q4")]:
-            manager.add(entry)
-        assert len(llm.calls) == 1  # one finished turn since, and a question still waiting for its answer: not yet
-        manager.add(answer("a4"))
-        assert sent(llm) == "Context:\nc2\n\nUser: q3\n\nAssistant: a3\n\nUser: q4\n\nAssistant: a4"  # the new ones only
-        assert '"destination": "Kyoto"' in llm.calls[1]["user_prompt"].text  # with the current notes
-        assert manager.notes["destination"] == "Tokyo"
-
-    def test_a_question_does_not_finish_a_turn_its_answer_does(self):
-        manager, llm = noting([UserPrompt(text="q1"), *notes("a")], notes_json(destination="x"), notes_every=1)
-        assert llm.calls == []
-        manager.add(answer("r1"))
-        assert sent(llm) == "User: q1\n\nContext:\na\n\nAssistant: r1"  # the question and its answer together
-
-    def test_an_answer_that_calls_a_tool_is_the_middle_of_a_turn(self):
-        manager, llm = noting([UserPrompt(text="q1"), answer("r1", calls=["m1"]), result("m1")],
-                              notes_json(destination="x"), notes_every=1)
-        assert llm.calls == []
-        manager.add(answer("r1b"))
-        assert len(llm.calls) == 1 and sent(llm).endswith("Assistant: r1b")
-
-    def test_active_is_the_summary_the_notes_then_the_window(self):
-        llm = FakeLLM(notes_json(destination="Kyoto"))
-        manager = managed([SystemPrompt(text="S"), UserPrompt(text="q1"), answer("r1"), *notes("a", "b")],
-                          policy=LastNPolicy(1),
-                          compaction=RollingCompaction(FakeSummarizer()),
-                          note_taker=NoteTaker(llm, schema=TripNotes), notes_every=1)
-        active = manager.active
-        assert isinstance(active[0], SummaryEntry) and isinstance(active[1], WorkingNotesEntry)
-        assert texts(active[2:]) == ["S", "b"]
-        assert [type(e).__name__ for e in manager.pinned] == ["SummaryEntry", "WorkingNotesEntry", "SystemPrompt"]
-
-    def test_the_notes_are_never_in_the_window_nor_summarized(self):
-        summarizer = FakeSummarizer()
-        manager = managed([UserPrompt(text="q1"), answer("r1"), *notes("a", "b", "c")], policy=LastNPolicy(1),
-                          compaction=RollingCompaction(summarizer),
-                          note_taker=NoteTaker(FakeLLM(notes_json(destination="x")), schema=TripNotes),
-                          notes_every=1)
-        assert all(not any("Working notes" in label for label in call[0]) for call in summarizer.calls)
-        assert isinstance(manager.active[1], WorkingNotesEntry)
-
-    def test_without_notes_every_only_on_demand(self):
-        manager, llm = noting([UserPrompt(text="q1"), UserPrompt(text="q2")], notes_json(destination="Kyoto"))
-        assert llm.calls == [] and manager.notes is None
-        update = manager.refresh_notes()
-        assert update.notes == manager.notes and update.response.text == notes_json(destination="Kyoto")
-
-    def test_an_answer_that_does_not_fit_keeps_the_notes_and_the_entries_for_the_next_update(self):
-        manager, llm = noting([UserPrompt(text="q1")], notes_json(destination="Kyoto"),
-                              json.dumps({"destination": ["not", "a", "string"]}), notes_json(destination="Tokyo"))
-        manager.refresh_notes()
-        manager.add(UserPrompt(text="q2"))
-        with pytest.raises(ValueError, match="do not fit TripNotes"):
-            manager.refresh_notes()
-        assert manager.notes["destination"] == "Kyoto"
-        manager.add(UserPrompt(text="q3"))
-        manager.refresh_notes()
-        assert sent(llm) == "User: q2\n\nUser: q3" and manager.notes["destination"] == "Tokyo"
-
-    def test_an_answer_that_leaves_out_sections_keeps_the_notes_and_the_entries_for_the_next_update(self):
-        kept = notes_json(destination="Kyoto", constraints=["Direct flights only"])
-        manager, llm = noting([UserPrompt(text="q1")], kept, json.dumps({"destination": "Kyoto"}),
-                              notes_json(destination="Kyoto", constraints=["Direct flights only", "Vegetarian"]))
-        manager.refresh_notes()
-        manager.add(UserPrompt(text="q2"))
-        with pytest.raises(ValueError, match="leave out sections that had content: constraints"):
-            manager.refresh_notes()
-        assert manager.notes["constraints"] == ["Direct flights only"]  # not wiped
-        manager.add(UserPrompt(text="q3"))
-        manager.refresh_notes()
-        assert sent(llm) == "User: q2\n\nUser: q3"  # the refused update's entries were not lost
-        assert manager.notes["constraints"] == ["Direct flights only", "Vegetarian"]
-
-    def test_a_continued_session_restores_the_notes_and_what_arrived_since(self):
-        storage = InMemoryStorage()
-        first = ShortTermMemoryManager(storage, note_taker=NoteTaker(FakeLLM(notes_json(destination="Kyoto")),
-                                                                     schema=TripNotes), session_id="s1")
-        first.add(UserPrompt(text="q1"))
-        first.refresh_notes()
-        first.add(UserPrompt(text="q2"))
-        first.add(answer("r2"))
-        llm = FakeLLM(notes_json(destination="Tokyo"))
-        again = ShortTermMemoryManager(storage, note_taker=NoteTaker(llm, schema=TripNotes), notes_every=2,
-                              session_id="s1")
-        assert again.notes["destination"] == "Kyoto" and llm.calls == []
-        again.add(UserPrompt(text="q3"))
-        again.add(answer("r3"))  # r2 and r3: two finished turns since the stored version
-        assert sent(llm) == "User: q2\n\nAssistant: r2\n\nUser: q3\n\nAssistant: r3"
-        assert again.notes["destination"] == "Tokyo"
-
-    def test_refused(self):
-        manager, _ = noting([UserPrompt(text="q1")], notes_json(destination="Kyoto"))
-        manager.refresh_notes()
-        with pytest.raises(ValueError, match="no entries"):
-            manager.refresh_notes()  # nothing arrived since
-        with pytest.raises(ValueError, match="no note_taker"):
-            managed(notes("a")).refresh_notes()
-        with pytest.raises(ValueError, match="notes come from the note taker"):
-            manager.add(WorkingNotesEntry(notes={"destination": "x"}))
-        notes_id = manager.active[0].id_
-        with pytest.raises(ValueError, match="pinned by rule"):
-            manager.pin(notes_id)
-        with pytest.raises(ValueError, match="stay pinned"):
-            manager.unpin(notes_id)
-
-    @pytest.mark.parametrize("settings, message", [
-        ({"notes_every": 2}, "notes_every needs a note_taker"),
-        ({"note_taker": NoteTaker(FakeLLM(), schema=TripNotes), "notes_every": 0},
-         "notes_every must be a positive"),
-    ])
-    def test_invalid_settings(self, settings, message):
-        with pytest.raises(ValueError, match=message):
-            ShortTermMemoryManager(InMemoryStorage(), **settings)
+def with_notes(storage=None):
+    return ShortTermMemoryManager(storage or InMemoryStorage(), session_id="trip", notes_llm=LLM,  # type: ignore[arg-type]
+                                  notes_schema=TripNotes)
 
 
 class TestSetNotes:
-    def test_sets_one_section_without_an_llm_call(self):
-        manager, llm = noting([UserPrompt(text="q1")], notes_json(destination="Kyoto"))
-        manager.refresh_notes()
-        manager.set_notes("next_step", "Book the hotel")
-        assert manager.notes == {"destination": "Kyoto", "constraints": [], "next_step": "Book the hotel"}
-        assert len(llm.calls) == 1
-        versions = [e for e in manager.entries if isinstance(e, WorkingNotesEntry)]
-        assert [v.source for v in versions] == ["note_taker", "app"] and manager.active[0].id_ == versions[-1].id_
+    def test_the_first_version_holds_every_section(self):
+        made = with_notes()
+        entry = made.set_notes("destination", "Kyoto")
+        assert entry.payload == Notes(sections={**EMPTY, "destination": "Kyoto"}, source="app")
+        assert made.notes == entry
+        assert made.active == [entry]
+        assert made.storage.entries("trip") == [entry]
 
-    def test_the_entries_since_the_last_update_stay_queued(self):
-        manager, llm = noting([UserPrompt(text="q1")], notes_json(destination="Kyoto"),
-                              notes_json(destination="Kyoto", next_step="Book the hotel"))
-        manager.refresh_notes()
-        manager.add(UserPrompt(text="q2"))
-        manager.set_notes("next_step", "Book the hotel")
-        manager.add(UserPrompt(text="q3"))
-        manager.refresh_notes()
-        assert sent(llm) == "User: q2\n\nUser: q3"
-        assert '"next_step": "Book the hotel"' in llm.calls[1]["user_prompt"].text  # the note taker sees it
+    def test_each_set_is_a_new_version_that_keeps_the_other_sections(self):
+        made = with_notes()
+        first = made.set_notes("destination", "Kyoto")
+        second = made.set_notes("budget", 3000)
+        assert second.payload == Notes(sections={**EMPTY, "destination": "Kyoto", "budget": 3000}, source="app")
+        assert made.notes == second
+        assert made.storage.entries("trip") == [first, second]
 
-    def test_notes_every_still_counts_the_turns_since_the_last_update(self):
-        manager, llm = noting([UserPrompt(text="q1"), answer("r1")], notes_json(destination="Kyoto"), notes_every=2)
-        manager.set_notes("next_step", "Book the hotel")
-        manager.add(UserPrompt(text="q2"))
-        assert llm.calls == []
-        manager.add(answer("r2"))  # the second finished turn: set_notes did not restart the count
-        assert sent(llm) == "User: q1\n\nAssistant: r1\n\nUser: q2\n\nAssistant: r2"
+    def test_the_value_is_stored_as_the_schema_writes_it(self):
+        assert with_notes().set_notes("budget", "3000").payload == Notes(sections={**EMPTY, "budget": 3000}, source="app")
 
-    def test_the_first_notes_can_start_from_one_section(self):
-        manager, _ = noting([UserPrompt(text="q1")])
-        manager.set_notes("next_step", "Plan the route")
-        assert manager.notes == {"next_step": "Plan the route"}
+    def test_a_section_with_an_alias_is_set_by_its_field_name(self):
+        notes = with_notes().set_notes("next_step", "Book the ryokan")
+        assert notes.payload == Notes(sections={**EMPTY, "next_step": "Book the ryokan"}, source="app")
 
-    def test_without_a_note_taker_any_section_and_json_value(self):
-        manager = managed(notes("a"))
-        manager.set_notes("budget", {"usd": 3000})
-        assert manager.notes == {"budget": {"usd": 3000}} and isinstance(manager.active[0], WorkingNotesEntry)
-
-    def test_a_continued_session_still_hands_the_note_taker_what_arrived_since_its_update(self):
+    def test_a_manager_on_a_stored_session_sets_on_its_notes(self):
         storage = InMemoryStorage()
-        first = ShortTermMemoryManager(storage, note_taker=NoteTaker(FakeLLM(notes_json(destination="Kyoto")),
-                                                                     schema=TripNotes), session_id="s1")
-        first.add(UserPrompt(text="q1"))
-        first.refresh_notes()
-        first.add(UserPrompt(text="q2"))
-        first.set_notes("next_step", "Book the hotel")
-        llm = FakeLLM(notes_json(destination="Kyoto", next_step="Book the hotel"))
-        again = ShortTermMemoryManager(storage, note_taker=NoteTaker(llm, schema=TripNotes), session_id="s1")
-        assert again.notes["next_step"] == "Book the hotel"
-        again.add(UserPrompt(text="q3"))
-        again.refresh_notes()
-        assert sent(llm) == "User: q2\n\nUser: q3"
+        storage.add("trip", Entry.of(Notes(sections={**EMPTY, "destination": "Paris"})))
+        notes = with_notes(storage).set_notes("budget", 3000)
+        assert notes.payload == Notes(sections={**EMPTY, "destination": "Paris", "budget": 3000}, source="app")
 
-    @pytest.mark.parametrize("section, value, error, message", [
-        ("constraints", "not a list", ValueError, "does not fit section 'constraints' of TripNotes"),
-        ("budget", 3000, ValueError, "'budget' is not a section of TripNotes"),
-        ("", "x", ValueError, "section"),
-        (None, "x", TypeError, "section"),
-    ])
-    def test_refused_changing_nothing(self, section, value, error, message):
-        manager, _ = noting([UserPrompt(text="q1")], notes_json(destination="Kyoto"))
-        manager.refresh_notes()
-        before = (manager.notes, len(manager.entries))
-        with pytest.raises(error, match=message):
-            manager.set_notes(section, value)
-        assert (manager.notes, len(manager.entries)) == before
+    def test_without_notes_settings_it_is_refused(self):
+        with pytest.raises(NoNotesSettingsError, match="no notes settings"):
+            manager().set_notes("destination", "Kyoto")
+
+    def test_a_section_that_is_not_in_the_schema_is_refused(self):
+        made = with_notes()
+        with pytest.raises(ValueError, match="'hotel' is not a section of TripNotes: destination, budget"):
+            made.set_notes("hotel", "Ryokan")
+        assert made.notes is None
+
+    def test_a_value_that_does_not_fit_is_refused_and_nothing_changes(self):
+        made = with_notes()
+        kept = made.set_notes("destination", "Kyoto")
+        with pytest.raises(ValueError, match="'cheap' does not fit section 'budget' of TripNotes"):
+            made.set_notes("budget", "cheap")
+        assert made.notes == kept
+        assert made.storage.entries("trip") == [kept]
 
 
-class Spying(InMemoryStorage):
-    """Counts full reads of a session and records the IDs fetched; its index is cheap, like SQLite's."""
+class TestChooseWindow:
+    def test_the_window_is_chosen_again_when_an_entry_arrives(self):
+        made = manager(policy=LastNPolicy(2))
+        made.add(note("a"))
+        assert ids(made.window) == ["a"]
+        made.add(note("b"))
+        made.add(note("c"))
+        assert ids(made.window) == ["b", "c"]
+
+    def test_a_manager_on_a_stored_session_chooses_its_window_when_it_starts(self):
+        assert ids(opened(note("a"), note("b"), note("c"), policy=LastNPolicy(2)).window) == ["b", "c"]
+
+    def test_the_policy_chooses_only_from_the_history(self):
+        seen = []
+
+        def keep(entry):
+            seen.append(entry.id_)
+            return True
+
+        made = opened(note("a"), summary("Earlier."), notes("Kyoto"), policy=PredicateFilterPolicy(keep))
+        made.add(note("rule"), pinned=True)
+        assert set(seen) == {"a"}  # no summary, notes or pinned entry
+
+
+def llm_response(text, messages=()):
+    return LLMResponse(text=text, messages=list(messages), provider="openai", id_="resp", model="m",
+                       created_at=datetime(2026, 1, 1, tzinfo=timezone.utc), status="completed")
+
+
+def answer(name, calls=()):
+    """The model's answer with ID ``name``; with tool ``calls``, the turn goes on."""
+    messages = [ResponseMessage(id=call, role="assistant", content=ToolCallContent(
+        data=ToolCall(name="search", arguments={}, status="complete", raw=None))) for call in calls]
+    return Entry.of(llm_response(name, messages)).model_copy(update={"id_": name})
+
+
+class ScriptedLLM:
+    """Answers each call with the next of ``answers`` and records the calls."""
+
+    def __init__(self, *answers):
+        self.answers, self.calls = list(answers), []
+
+    def query(self, **parameters):
+        return self._answer(parameters)
+
+    async def query_async(self, **parameters):
+        return self._answer(parameters)
+
+    def _answer(self, parameters):
+        self.calls.append(parameters)
+        return llm_response(self.answers.pop(0))
+
+
+def notes_answer(**sections):
+    """The LLM's answer: the complete notes, under the schema's names (``next`` is ``next_step``'s alias)."""
+    return json.dumps({"destination": None, "budget": None, "constraints": [], "next": None, **sections})
+
+
+def noting(llm, storage=None, **settings):
+    return ShortTermMemoryManager(storage if storage is not None else InMemoryStorage(), session_id="trip",
+                                  notes_llm=llm, notes_schema=TripNotes, **settings)
+
+
+class TestUpdateNotes:
+    def test_without_notes_settings_the_error_is_a_value_error(self):
+        assert issubclass(NoNotesSettingsError, ValueError)
+
+    def test_the_answer_becomes_the_new_notes_version(self):
+        made = noting(ScriptedLLM(notes_answer(destination="Kyoto")))
+        made.add(note("a", "I want to go to Kyoto."))
+        entry = made.update_notes()
+        assert entry.payload == Notes(sections={**EMPTY, "destination": "Kyoto"})
+        assert made.notes == entry
+
+    def test_the_llm_gets_the_notes_instructions_the_notes_and_the_entries(self):
+        llm = ScriptedLLM(notes_answer(destination="Kyoto"))
+        made = noting(llm)
+        made.add(note("a", "I want to go to Kyoto."))
+        made.update_notes()
+        (call,) = llm.calls
+        assert call["system_prompt"].text == made.notes_instructions
+        assert call["user_prompt"].text.startswith(
+            "Text:\nCurrent notes:\n{}\n\nConversation since the last update:\nContext:\nI want to go to Kyoto.\n\n"
+        )
+
+    def test_the_next_update_gets_only_the_entries_since_the_last_one(self):
+        llm = ScriptedLLM(notes_answer(destination="Kyoto"), notes_answer(destination="Kyoto", budget=3000))
+        made = noting(llm)
+        made.add(note("a", "I want to go to Kyoto."))
+        made.update_notes()
+        made.add(note("b", "My budget is 3000."))
+        made.update_notes()
+        prompt = llm.calls[1]["user_prompt"].text
+        assert "Current notes:\n" + json.dumps({**EMPTY, "destination": "Kyoto"}, indent=2) in prompt
+        assert "My budget is 3000." in prompt and "I want to go to Kyoto." not in prompt
+
+    def test_a_version_set_by_the_app_is_not_an_update(self):
+        llm = ScriptedLLM(notes_answer(destination="Kyoto", budget=3000))
+        made = noting(llm)
+        made.add(note("a", "I want to go to Kyoto."))
+        made.set_notes("budget", 3000)
+        made.update_notes()
+        prompt = llm.calls[0]["user_prompt"].text
+        assert '"budget": 3000' in prompt and "I want to go to Kyoto." in prompt
+
+    def test_without_notes_settings_it_is_refused(self):
+        with pytest.raises(NoNotesSettingsError, match="no notes settings"):
+            manager().update_notes()
+
+    def test_with_nothing_new_it_is_refused(self):
+        made = noting(ScriptedLLM(notes_answer(destination="Kyoto")))
+        with pytest.raises(ValueError, match="nothing arrived since the last notes update"):
+            made.update_notes()
+        made.add(note("a"))
+        made.update_notes()
+        with pytest.raises(ValueError, match="nothing arrived"):
+            made.update_notes()
+
+    def test_after_a_bad_answer_the_notes_and_the_entries_wait_for_the_next_update(self):
+        llm = ScriptedLLM('{"destination": "Kyoto"}', notes_answer(destination="Kyoto"))
+        made = noting(llm)
+        made.add(note("a", "I want to go to Kyoto."))
+        with pytest.raises(ValueError, match="leaves out fields"):
+            made.update_notes()
+        assert made.notes is None
+        made.update_notes()
+        assert "I want to go to Kyoto." in llm.calls[1]["user_prompt"].text
+
+    def test_a_repeated_answer_is_not_another_finished_turn(self):
+        llm = ScriptedLLM(notes_answer(destination="Kyoto"))
+        made = noting(llm, notes_every=2)
+        made.add(note("q1"))
+        made.add(answer("a1"))
+        assert made.add(answer("a1")) is False  # a retried add
+        assert llm.calls == []
+        made.add(note("q2"))
+        made.add(answer("a2"))  # the second turn finishes
+        assert len(llm.calls) == 1
+
+    def test_every_n_finished_turns_the_notes_are_updated(self):
+        llm = ScriptedLLM(notes_answer(destination="Kyoto"))
+        made = noting(llm, notes_every=2)
+        made.add(note("q1"))
+        made.add(answer("a1", calls=["c1"]))  # asks for a tool: the turn goes on
+        made.add(answer("a2"))  # the first turn finishes
+        made.add(note("q2"))
+        assert llm.calls == []
+        made.add(answer("a3"))  # the second turn finishes
+        assert len(llm.calls) == 1
+        assert made.notes is not None
+        made.add(answer("a4"))  # the count starts again
+        assert len(llm.calls) == 1
+
+
+class Recorder(SummaryWorker):
+    """Answers "summary 1", "summary 2"... and records the texts it got; fails when ``fail`` is set."""
 
     def __init__(self):
-        super().__init__()
-        self.full_reads, self.fetched = 0, []
+        self.texts, self.fail = [], False
 
-    def entries(self, session_id):
-        self.full_reads += 1
-        return super().entries(session_id)
-
-    def index(self, session_id):
-        return [(entry.id_, type(entry).__name__) for entry in InMemoryStorage.entries(self, session_id)]
-
-    def get(self, session_id, entry_ids):
-        self.fetched += list(entry_ids)
-        return self._pick(session_id, list(entry_ids), InMemoryStorage.entries(self, session_id))
+    def _summarize(self, text):
+        if self.fail:
+            raise ValueError("the model is down")
+        self.texts.append(text)
+        return f"summary {len(self.texts)}"
 
 
-class TestReadingLittle:
-    @staticmethod
-    def opened(storage):
-        return ShortTermMemoryManager(storage, policy=LastNPolicy(2), compaction=RollingCompaction(FakeSummarizer()),
-                                      session_id="s1")
+def summarizing(policy, **settings):
+    recorder = Recorder()
+    return ShortTermMemoryManager(InMemoryStorage(), session_id="trip", policy=policy, summarizer=recorder,
+                                  **settings), recorder
 
-    def test_a_continued_session_fetches_only_the_summary_and_the_window(self):
-        storage = Spying()
-        first = self.opened(storage)
-        for entry in notes(*map(str, range(30))):
-            first.add(entry)
-        storage.full_reads, storage.fetched = 0, []
-        again = self.opened(storage)
-        assert storage.full_reads == 0 and len(storage.fetched) == 3  # the summary, then the two-entry window
-        assert [e.id_ for e in again.active] == [e.id_ for e in first.active]
 
-    def test_set_policy_and_rewind_never_read_the_whole_session(self):
-        storage = Spying()
-        manager = self.opened(storage)
-        for entry in notes(*map(str, range(30))):
-            manager.add(entry)
-        target = history(manager)[-2].id_  # "28"
-        storage.full_reads = 0
-        manager.policy = LastNPolicy(3)
-        manager.rewind(target)
-        assert storage.full_reads == 0
-        assert texts(manager.window) == ["27", "28"]
+class TestSummarize:
+    def test_entries_that_leave_the_window_are_summarized(self):
+        made, recorder = summarizing(LastNPolicy(2))
+        made.add(note("a"))
+        made.add(note("b"))
+        assert made.summary is None
+        made.add(note("c"))
+        assert recorder.texts == ["Context:\na"]
+        assert made.summary is not None and made.summary.payload == Summary(text="summary 1", newly_covered=["a"])
+        assert ids(made.active) == [made.summary.id_, "b", "c"]
 
-    def test_with_notes_every_only_the_entries_since_the_notes_are_fetched_for_the_turn_count(self):
-        storage = Spying()
-        taker = NoteTaker(FakeLLM(notes_json(destination="Kyoto")), schema=TripNotes)
-        first = ShortTermMemoryManager(storage, note_taker=taker, notes_every=5, session_id="s1")
-        for entry in [UserPrompt(text="q1"), answer("r1")]:
-            first.add(entry)
-        first.refresh_notes()
-        for entry in [UserPrompt(text="q2"), answer("r2")]:
-            first.add(entry)
-        storage.fetched = []
-        again = ShortTermMemoryManager(storage, note_taker=taker, notes_every=5, session_id="s1")
-        assert again._turns_since_notes == 1 and again._since_notes == first._since_notes
-        q1, r1, notes_version, q2, r2 = first.entries
-        # The notes version (to see who wrote it), then only q2 and r2 for the turn count; the rest is the window.
-        assert storage.fetched[:3] == [notes_version.id_, q2.id_, r2.id_]
+    def test_the_next_summary_starts_from_the_previous_one(self):
+        made, recorder = summarizing(LastNPolicy(2))
+        for name in "abcd":
+            made.add(note(name))
+        assert recorder.texts[1] == "Summary of the earlier conversation:\nsummary 1\n\nContext:\nb"
+        assert made.summary is not None and made.summary.payload == Summary(text="summary 2", newly_covered=["b"])
+
+    def test_entries_leaving_together_are_summarized_together(self):
+        made, recorder = summarizing(HeadTailPolicy(head=1, tail=1))
+        for name in "abc":
+            made.add(note(name))
+        made.add(note("d"))
+        assert recorder.texts == ["Context:\nb", "Summary of the earlier conversation:\nsummary 1\n\nContext:\nc"]
+
+    def test_a_summarized_entry_stays_in_the_history_but_leaves_the_pool(self):
+        seen = []
+
+        def keep(entry):
+            seen.append(entry.id_)
+            return True
+
+        made, _ = summarizing(PredicateFilterPolicy(keep).then(LastNPolicy(1)))
+        made.add(note("a"))
+        made.add(note("b"))
+        seen.clear()
+        made.add(note("c"))
+        assert seen == ["b", "c"]  # "a" is summarized: the policy no longer sees it
+        assert ids(made.entries) == ["a", "b", "c"]
+
+    def test_pinned_and_unwanted_entries_are_not_summarized(self):
+        made, recorder = summarizing(PredicateFilterPolicy(lambda entry: entry.id_ != "x").then(LastNPolicy(1)))
+        made.add(note("rule"), pinned=True)
+        made.add(note("x"))
+        made.add(note("a"))
+        made.add(note("b"))
+        assert recorder.texts == ["Context:\na"]
+
+    def test_without_a_summarizer_entries_that_leave_are_forgotten(self):
+        made = manager(policy=LastNPolicy(1))
+        made.add(note("a"))
+        made.add(note("b"))
+        assert made.summary is None
+        assert ids(made.active) == ["b"]
+
+    def test_when_the_summarizer_fails_the_entries_wait_for_the_next_add(self):
+        made, recorder = summarizing(LastNPolicy(1))
+        made.add(note("a"))
+        recorder.fail = True
+        with pytest.raises(ValueError, match="the model is down"):
+            made.add(note("b"))
+        assert made.summary is None
+        assert ids(made.entries) == ["a", "b"]  # "b" is stored all the same
+        recorder.fail = False
+        made.add(note("c"))
+        assert recorder.texts == ["Context:\na\n\nContext:\nb"]
+
+
+class TestCoverage:
+    def test_each_summary_version_lists_the_entries_it_added(self):
+        made, _ = summarizing(HeadTailPolicy(head=1, tail=1))
+        for name in "abcd":
+            made.add(note(name))
+        versions = [entry.payload for entry in made.storage.entries("trip") if isinstance(entry.payload, Summary)]
+        assert [version.newly_covered for version in versions] == [["b"], ["c"]]
+
+    def test_a_manager_on_a_stored_session_keeps_summarized_entries_out(self):
+        storage = InMemoryStorage()
+        first = ShortTermMemoryManager(storage, session_id="trip", policy=LastNPolicy(1), summarizer=Recorder())
+        for name in "abc":
+            first.add(note(name))  # "a" and "b" are summarized, in two versions
+        seen, recorder = [], Recorder()
+
+        def keep(entry):
+            seen.append(entry.id_)
+            return True
+
+        second = ShortTermMemoryManager(storage, session_id="trip", policy=PredicateFilterPolicy(keep).then(LastNPolicy(1)),
+                                        summarizer=recorder)
+        assert seen == ["c"]
+        second.add(note("d"))
+        assert recorder.texts == ["Summary of the earlier conversation:\nsummary 2\n\nContext:\nc"]
+
+
+class TestRemove:
+    def test_the_entry_leaves_the_storage_and_the_history(self):
+        made = manager(session_id="trip")
+        made.add(note("a"))
+        made.add(note("b"))
+        made.remove("a")
+        assert ids(made.entries) == ["b"]
+        assert ids(made.storage.entries("trip")) == ["b"]
+
+    def test_an_entry_that_is_not_stored_is_refused(self):
+        with pytest.raises(ValueError, match="entry 'x' is not stored in session 'trip'"):
+            manager(session_id="trip").remove("x")
+
+    def test_summary_and_notes_entries_are_refused(self):
+        earlier, kyoto = summary("Earlier."), notes("Kyoto")
+        made = opened(earlier, kyoto)
+        for entry in (earlier, kyoto):
+            with pytest.raises(ValueError, match="come from the manager"):
+                made.remove(entry.id_)
+        assert (made.summary, made.notes) == (earlier, kyoto)
+
+    def test_a_pin_record_is_refused(self):
+        made = manager(session_id="trip")
+        made.add(note("rule"), pinned=True)
+        (record_id,) = [entry_id for entry_id, kind in made.storage.index("trip") if kind is EntryKind.PIN]
+        with pytest.raises(ValueError, match="pin entries come from the manager"):
+            made.remove(record_id)
+        assert ids(made.pinned) == ["rule"]
+
+    def test_an_entry_the_notes_already_read_leaves_the_notes_as_they_are(self):
+        llm = ScriptedLLM(notes_answer(destination="Kyoto"))
+        made = noting(llm, notes_every=1)
+        made.add(note("q1", "I want to go to Kyoto."))
+        made.add(answer("a1"))  # the turn finishes: the notes are updated from q1 and a1
+        before = made.notes
+        made.remove("q1")
+        assert made.notes == before and len(llm.calls) == 1
+        with pytest.raises(ValueError, match="nothing arrived"):
+            made.update_notes()
+
+    def test_a_pinned_entry_is_no_longer_pinned(self):
+        made = manager()
+        made.add(note("rule"), pinned=True)
+        made.remove("rule")
+        assert made.pinned == [] and made.active == []
+        assert made.storage.entries("trip") == []  # the pin record is gone too
+
+    def test_the_window_is_chosen_again(self):
+        made = manager(policy=LastNPolicy(2))
+        for name in "abc":
+            made.add(note(name))
+        made.remove("c")
+        assert ids(made.window) == ["a", "b"]  # "a" was dropped without a summary: it comes back
+
+    def test_a_summarized_entry_does_not_come_back_and_the_summary_stays(self):
+        made, _ = summarizing(LastNPolicy(2))
+        for name in "abc":
+            made.add(note(name))
+        before = made.summary
+        made.remove("c")
+        assert ids(made.window) == ["b"]
+        made.remove("a")
+        assert made.summary == before
+        assert ids(made.entries) == ["b"]
+
+    def test_an_entry_waiting_for_the_notes_is_no_longer_sent(self):
+        llm = ScriptedLLM(notes_answer(destination="Kyoto"))
+        made = noting(llm)
+        made.add(note("a", "I want to go to Paris."))
+        made.add(note("b", "I want to go to Kyoto."))
+        made.remove("a")
+        made.update_notes()
+        prompt = llm.calls[0]["user_prompt"].text
+        assert "Kyoto" in prompt and "Paris" not in prompt
+
+    def test_a_removed_finished_turn_no_longer_counts(self):
+        llm = ScriptedLLM(notes_answer(destination="Kyoto"))
+        made = noting(llm, notes_every=2)
+        made.add(answer("a1"))
+        made.remove("a1")
+        made.add(answer("a2"))
+        assert llm.calls == []
+        made.add(answer("a3"))
+        assert len(llm.calls) == 1
+
+    def test_the_archive_keeps_its_copy_and_the_next_dump_starts_at_the_right_place(self):
+        archive = InMemoryStorage()
+        made = manager(session_id="trip", dump_storage=archive)
+        made.add(note("a"))
+        made.add(note("b"))
+        made.dump()
+        made.remove("a")
+        made.add(note("c"))
+        assert ids(made.dump()) == ["c"]
+        assert archived(archive) == ["a", "b", "c"]
+
+
+class TestCompact:
+    @pytest.fixture(autouse=True)
+    def words(self, monkeypatch):
+        """Count tokens as words: each ``note`` reads "Context:" and one word, so it is 2 tokens."""
+        monkeypatch.setattr(Tokens, "count", staticmethod(lambda text, encoding="o200k_base": len(text.split())))
+
+    def test_without_a_summarizer_it_is_refused(self):
+        with pytest.raises(ValueError, match="no summarizer"):
+            manager().compact()
+
+    @pytest.mark.parametrize("max_tokens", [0, -1, 2.5])
+    def test_max_tokens_must_be_a_positive_integer(self, max_tokens):
+        made, _ = summarizing(None)
+        with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
+            made.compact(max_tokens)
+
+    def test_an_empty_window_is_left_as_it_is(self):
+        made, recorder = summarizing(LastNPolicy(5))
+        assert made.compact() is None
+        made.add(note("rule"), pinned=True)  # pinned: not in the window
+        assert made.compact() is None and recorder.texts == [] and made.summary is None
+
+    def test_with_no_budget_the_whole_window_moves_into_the_summary(self):
+        made, recorder = summarizing(None)
+        for name in "abc":
+            made.add(note(name))
+        summary_entry = made.compact()
+        assert recorder.texts == ["Context:\na\n\nContext:\nb\n\nContext:\nc"]
+        assert made.window == []
+        assert made.active == [summary_entry]
+
+    def test_with_a_budget_the_oldest_move_until_the_window_fits(self):
+        made, _ = summarizing(None)
+        for name in "abcd":
+            made.add(note(name))
+        summary_entry = made.compact(max_tokens=5)  # c and d: 4 tokens; with b: 6
+        assert summary_entry is not None and summary_entry.payload == Summary(text="summary 1", newly_covered=["a", "b"])
+        assert ids(made.window) == ["c", "d"]
+
+    def test_a_window_that_fits_is_left_as_it_is(self):
+        made, recorder = summarizing(None)
+        made.add(note("a"))
+        assert made.compact(max_tokens=100) is None
+        assert recorder.texts == [] and ids(made.window) == ["a"]
+
+    def test_when_even_the_newest_does_not_fit_the_whole_window_moves(self):
+        made, _ = summarizing(None)
+        made.add(note("a"))
+        made.compact(max_tokens=1)
+        assert made.window == []
+
+    def test_the_window_grows_again_but_what_moved_never_comes_back(self):
+        made, _ = summarizing(LastNPolicy(3))
+        for name in "abc":
+            made.add(note(name))
+        made.compact(max_tokens=2)
+        assert ids(made.window) == ["c"]
+        made.add(note("d"))
+        assert ids(made.window) == ["c", "d"]
+
+    def test_pinned_entries_stay_and_do_not_count(self):
+        made, _ = summarizing(None)
+        made.add(note("rule"), pinned=True)
+        made.add(note("a"))
+        made.add(note("b"))
+        made.compact(max_tokens=2)
+        assert ids(made.pinned) == ["rule"]
+        assert ids(made.window) == ["b"]
+
+    def test_when_the_summarizer_fails_nothing_changes(self):
+        made, recorder = summarizing(None)
+        made.add(note("a"))
+        recorder.fail = True
+        with pytest.raises(ValueError, match="the model is down"):
+            made.compact()
+        assert made.summary is None and ids(made.window) == ["a"]
+
+
+class TestSetPolicy:
+    def test_the_window_is_chosen_again_with_the_new_policy(self):
+        made = manager()
+        for name in "abc":
+            made.add(note(name))
+        policy = LastNPolicy(1)
+        made.set_policy(policy)
+        assert made.policy is policy and ids(made.window) == ["c"]
+
+    def test_what_the_new_policy_drops_is_summarized(self):
+        made, recorder = summarizing(None)
+        for name in "abc":
+            made.add(note(name))
+        made.set_policy(LastNPolicy(1))
+        assert recorder.texts == ["Context:\na\n\nContext:\nb"]
+
+    def test_entries_dropped_without_a_summary_can_come_back(self):
+        made = manager(policy=LastNPolicy(1))
+        for name in "ab":
+            made.add(note(name))
+        made.set_policy(None)
+        assert ids(made.window) == ["a", "b"]
+
+    def test_summarized_entries_never_come_back(self):
+        made, _ = summarizing(LastNPolicy(1))
+        for name in "ab":
+            made.add(note(name))
+        made.set_policy(None)
+        assert ids(made.window) == ["b"]
+
+    def test_only_a_policy_is_accepted(self):
+        with pytest.raises(TypeError, match="policy must be a Policy, got str"):
+            manager().set_policy("LastNPolicy(1)")  # type: ignore[arg-type]
+
+
+class TestResume:
+    """A manager opened on a stored session gets all its state back."""
+
+    def test_the_pins(self):
+        storage = InMemoryStorage()
+        first = ShortTermMemoryManager(storage, session_id="trip", policy=LastNPolicy(1))
+        first.add(note("rule"), pinned=True)
+        first.add(note("a"))
+        first.add(note("b"))
+        again = ShortTermMemoryManager(storage, session_id="trip", policy=LastNPolicy(1))
+        assert ids(again.pinned) == ["rule"] and ids(again.window) == ["b"]
+
+    def test_a_removed_pinned_entry_stays_unpinned(self):
+        storage = InMemoryStorage()
+        first = ShortTermMemoryManager(storage, session_id="trip")
+        first.add(note("rule"), pinned=True)
+        first.remove("rule")
+        assert ShortTermMemoryManager(storage, session_id="trip").pinned == []
+
+    def test_the_entries_waiting_for_the_notes(self):
+        storage = InMemoryStorage()
+        first = noting(ScriptedLLM(notes_answer(destination="Paris")), storage=storage)
+        first.add(note("a", "Paris, maybe."))
+        first.update_notes()
+        first.add(note("b", "No: Kyoto."))
+        first.set_notes("budget", 3000)  # the app's version: "b" still waits
+        llm = ScriptedLLM(notes_answer(destination="Kyoto", budget=3000))
+        noting(llm, storage=storage).update_notes()
+        prompt = llm.calls[0]["user_prompt"].text
+        assert "No: Kyoto." in prompt and "Paris, maybe." not in prompt
+        assert '"budget": 3000' in prompt
+
+    def test_the_finished_turns_toward_notes_every(self):
+        storage = InMemoryStorage()
+        noting(ScriptedLLM(), storage=storage, notes_every=2).add(answer("a1"))
+        llm = ScriptedLLM(notes_answer(destination="Kyoto"))
+        noting(llm, storage=storage, notes_every=2).add(answer("a2"))
+        assert len(llm.calls) == 1
+
+    def test_a_dump_continues_where_the_archive_ends(self):
+        storage, archive = InMemoryStorage(), InMemoryStorage()
+        first = ShortTermMemoryManager(storage, session_id="trip", dump_storage=archive)
+        first.add(note("a"))
+        first.dump()
+        first.add(note("b"))
+        assert ids(ShortTermMemoryManager(storage, session_id="trip", dump_storage=archive).dump()) == ["b"]
+
+    def test_the_adds_since_the_dump(self):
+        storage, archive = InMemoryStorage(), InMemoryStorage()
+        first = ShortTermMemoryManager(storage, session_id="trip", dump_storage=archive, dump_every=2)
+        for name in "abc":
+            first.add(note(name))  # a and b are dumped; c waits
+        again = ShortTermMemoryManager(storage, session_id="trip", dump_storage=archive, dump_every=2)
+        again.add(note("d"))  # c and d: two adds since the dump
+        assert archived(archive) == ["a", "b", "c", "d"]
 
 
 class TestRewind:
-    def test_what_came_after_no_longer_counts_and_nothing_is_removed(self):
-        manager = managed(notes("a", "b", "c", "d"))
-        manager.rewind(manager.entries[1].id_)
-        assert texts(manager.window) == ["a", "b"]
-        stored = manager.entries
-        assert texts(stored[:4]) == ["a", "b", "c", "d"] and isinstance(stored[4], RewindEntry)
+    def test_what_came_after_no_longer_counts(self):
+        made = manager(session_id="trip")
+        for name in "abc":
+            made.add(note(name))
+        made.rewind("a")
+        assert ids(made.entries) == ["a"] and ids(made.window) == ["a"]
+        made.add(note("d"))
+        assert ids(made.entries) == ["a", "d"]
 
-    def test_new_entries_continue_from_there(self):
-        manager = managed(notes("a", "b", "c"))
-        manager.rewind(manager.entries[0].id_)
-        manager.add(ContextEntry(text="d"))
-        assert texts(manager.window) == ["a", "d"]
+    def test_rewinding_to_the_newest_entry_changes_nothing(self):
+        made = manager(session_id="trip", policy=LastNPolicy(1))
+        for name in "ab":
+            made.add(note(name))
+        made.rewind("b")
+        assert ids(made.entries) == ["a", "b"] and ids(made.window) == ["b"]
 
-    def test_the_summary_goes_back_to_what_it_was_without_a_new_call(self):
-        summarizer = FakeSummarizer()
-        manager = compacting(notes("a", "b", "c", "d", "e"), summarizer, policy=LastNPolicy(2))
-        c = next(e for e in history(manager) if e.text == "c")
-        calls = len(summarizer.calls)
-        manager.rewind(c.id_)
-        assert texts(manager.active) == ["summary #1 of a", "b", "c"] and len(summarizer.calls) == calls
+    def test_an_entry_that_is_not_stored_or_that_the_manager_made_is_refused(self):
+        earlier = summary("Earlier.")
+        made = opened(note("a"), earlier)
+        with pytest.raises(ValueError, match="entry 'x' is not stored"):
+            made.rewind("x")
+        with pytest.raises(ValueError, match="come from the manager; rewind"):
+            made.rewind(earlier.id_)
 
-    def test_rewinding_past_every_summary_leaves_none(self):
-        manager = compacting(notes("a", "b", "c", "d"), policy=LastNPolicy(2))
-        manager.rewind(manager.entries[1].id_)  # b, added before any summary
-        assert manager.summary is None and texts(manager.window) == ["a", "b"]
+    def test_the_summary_goes_back_to_the_version_the_entrys_add_made(self):
+        made, _ = summarizing(LastNPolicy(1))
+        for name in "abc":
+            made.add(note(name))  # adding b summarizes a; adding c summarizes b
+        at_b = next(entry for entry in made.storage.entries("trip") if isinstance(entry.payload, Summary))
+        made.rewind("b")
+        assert made.summary == at_b
+        assert ids(made.window) == ["b"]
 
-    def test_the_notes_and_the_note_takers_queue_go_back_too(self):
-        manager, llm = noting([UserPrompt(text="q1")], notes_json(destination="Kyoto"),
-                              notes_json(destination="Tokyo"), notes_json(destination="Osaka"))
-        manager.refresh_notes()
-        q1 = manager.entries[0]
-        manager.add(UserPrompt(text="q2"))
-        manager.refresh_notes()
-        manager.rewind(q1.id_)
-        assert manager.notes["destination"] == "Kyoto"
-        manager.add(UserPrompt(text="q3"))
-        manager.refresh_notes()
-        assert sent(llm) == "User: q3"  # q2 no longer counts
+    def test_pins_after_the_entry_go_and_its_own_pin_stays(self):
+        made = manager()
+        made.add(note("a"), pinned=True)
+        made.add(note("b"), pinned=True)
+        made.rewind("a")
+        assert ids(made.pinned) == ["a"] and made.window == []
 
-    def test_the_system_prompt_goes_back_too(self):
-        manager = managed([SystemPrompt(text="S1"), *notes("a"), SystemPrompt(text="S2"), *notes("b")])
-        manager.rewind(manager.entries[1].id_)
-        assert texts(manager.window) == ["S1", "a"] and texts(manager.pinned) == ["S1"]
+    def test_the_notes_go_back_and_what_comes_next_waits_for_them(self):
+        llm = ScriptedLLM(notes_answer(destination="Paris"), notes_answer(destination="Kyoto"),
+                          notes_answer(destination="Rome"))
+        made = noting(llm)
+        made.add(note("a", "Paris."))
+        paris = made.update_notes()
+        made.add(note("b", "Kyoto."))
+        made.update_notes()
+        made.rewind("a")
+        assert made.notes == paris
+        with pytest.raises(ValueError, match="nothing arrived"):
+            made.update_notes()
+        made.add(note("c", "Rome."))
+        made.update_notes()
+        prompt = llm.calls[2]["user_prompt"].text
+        assert "Rome." in prompt and "Kyoto." not in prompt
 
-    def test_pins_on_entries_still_there_are_kept(self):
-        manager = managed(notes("a", "b"), policy=LastNPolicy(1))
-        b = manager.entries[1]
-        manager.pin(b.id_)
-        for entry in notes("c", "d"):
-            manager.add(entry)
-        manager.rewind(manager.entries[2].id_)  # c
-        assert texts(manager.window) == ["b", "c"] and b.id_ in {e.id_ for e in manager.pinned}
+    def test_the_archive_keeps_its_copies_and_the_dump_goes_on(self):
+        archive = InMemoryStorage()
+        made = manager(session_id="trip", dump_storage=archive)
+        for name in "abc":
+            made.add(note(name))
+        made.dump()
+        made.rewind("a")
+        made.add(note("d"))
+        assert ids(made.dump()) == ["d"]
+        assert archived(archive) == ["a", "b", "c", "d"]
 
-    def test_a_continued_session_comes_back_rewound(self):
+
+class TestUnpin:
+    def test_the_entry_goes_back_to_the_window_in_its_place(self):
+        made = manager(session_id="trip")
+        made.add(note("rule"), pinned=True)
+        made.add(note("a"))
+        made.unpin("rule")
+        assert made.pinned == []
+        assert ids(made.window) == ["rule", "a"]
+        assert ids(made.storage.entries("trip")) == ["rule", "a"]  # the pin record is gone
+
+    def test_an_old_entry_leaves_at_once_and_is_summarized(self):
+        made, recorder = summarizing(LastNPolicy(1))
+        made.add(note("rule"), pinned=True)
+        made.add(note("a"))
+        made.add(note("b"))  # summarizes "a"
+        made.unpin("rule")
+        assert recorder.texts[-1] == "Summary of the earlier conversation:\nsummary 1\n\nContext:\nrule"
+        assert ids(made.window) == ["b"]
+
+    def test_an_entry_that_is_not_pinned_is_refused(self):
+        made = manager()
+        made.add(note("a"))
+        with pytest.raises(ValueError, match="entry 'a' is not pinned"):
+            made.unpin("a")
+
+    def test_a_manager_opened_later_sees_it_unpinned(self):
         storage = InMemoryStorage()
+        first = ShortTermMemoryManager(storage, session_id="trip")
+        first.add(note("rule"), pinned=True)
+        first.unpin("rule")
+        assert ShortTermMemoryManager(storage, session_id="trip").pinned == []
 
-        def opened():
-            return ShortTermMemoryManager(storage, policy=LastNPolicy(2), compaction=RollingCompaction(FakeSummarizer()),
-                                          session_id="s1")
-
-        first = opened()
-        for entry in notes("a", "b", "c", "d", "e"):
-            first.add(entry)
-        first.rewind(next(e for e in history(first) if e.text == "c").id_)
-        first.add(ContextEntry(text="f"))
-        again = opened()
-        assert [e.id_ for e in again.active] == [e.id_ for e in first.active]
-        assert texts(again.active) == ["summary #4 of b", "c", "f"]  # b left when f came: the 4th call
-
-    def test_a_marker_whose_entry_is_not_there_is_ignored(self):
-        storage = InMemoryStorage()
-        for entry in [*notes("a"), RewindEntry(to_id="gone"), *notes("b")]:
-            storage.add("s1", entry)
-        assert texts(ShortTermMemoryManager(storage, session_id="s1").window) == ["a", "b"]
-
-    def test_a_rewound_entrys_id_cannot_be_used_again(self):
-        manager = managed(notes("a", "b"))
-        b = manager.entries[1]
-        manager.rewind(manager.entries[0].id_)
-        with pytest.raises(ValueError, match="already in the session"):
-            manager.add(ContextEntry(id_=b.id_, text="b again"))
-
-    def test_refused_changing_nothing(self):
-        manager = compacting(notes("a", "b", "c"), policy=LastNPolicy(1))
-        a, summary, c = manager.entries[0], manager.summary, history(manager)[2]
-        manager.rewind(a.id_)
-        count = len(manager.entries)
-        for entry_id in (summary.id_, c.id_, "nope"):
-            with pytest.raises(ValueError, match="not in the history"):
-                manager.rewind(entry_id)
-        with pytest.raises(ValueError, match="rewinds come from rewind"):
-            manager.add(RewindEntry(to_id=a.id_))
-        assert len(manager.entries) == count
+    def test_the_next_dump_starts_at_the_right_place(self):
+        archive = InMemoryStorage()
+        made = manager(session_id="trip", dump_storage=archive)
+        made.add(note("rule"), pinned=True)
+        made.add(note("a"))
+        made.dump()
+        made.unpin("rule")
+        made.add(note("b"))
+        assert ids(made.dump()) == ["b"]
 
 
-def filters_keep(policy, entries):
-    """What the filter part of ``policy`` keeps: all of a filter, the leading filters of a chain, else everything."""
-    if policy.is_filter:
-        return policy.select(entries)
-    if isinstance(policy, ChainPolicy):
-        for part in [p for p in policy.policies if p.is_filter]:
-            entries = part.select(entries)
-    return entries
+def system(name, text=None):
+    """A system prompt entry with ID ``name``."""
+    return Entry.of(SystemPrompt(text=text or name)).model_copy(update={"id_": name})
 
 
-class TestDumpEvery:
-    def test_dumps_by_itself_after_every_n_adds(self):
-        dump = InMemoryStorage()
-        manager = managed(notes("a", "b", "c", "d", "e"), dump_storage=dump, dump_every=2)
-        assert texts(dump.entries(manager.session_id)) == ["a", "b", "c", "d"]  # after b, then after d
-        manager.add(ContextEntry(text="f"))
-        assert texts(dump.entries(manager.session_id)) == ["a", "b", "c", "d", "e", "f"]
-
-    def test_a_manual_dump_starts_the_count_again(self):
-        dump = InMemoryStorage()
-        manager = managed(notes("a"), dump_storage=dump, dump_every=2)
-        manager.dump()
-        manager.add(ContextEntry(text="b"))
-        assert texts(dump.entries(manager.session_id)) == ["a"]  # one add since the dump, not two
-
-    def test_each_dump_includes_the_summary_made_in_the_same_add(self):
-        dump = InMemoryStorage()
-        manager = compacting(notes("a", "b", "c"), policy=LastNPolicy(2), dump_storage=dump, dump_every=3)
-        dumped = dump.entries(manager.session_id)
-        assert [type(e).__name__ for e in dumped] == ["ContextEntry", "ContextEntry", "ContextEntry", "SummaryEntry"]
-
-    @pytest.mark.parametrize("settings, message", [
-        ({"dump_every": 2}, "dump_every needs a dump_storage"),
-        ({"dump_storage": InMemoryStorage(), "dump_every": 0}, "dump_every must be a positive integer"),
-    ])
-    def test_invalid_settings(self, settings, message):
-        with pytest.raises(ValueError, match=message):
-            ShortTermMemoryManager(InMemoryStorage(), **settings)
+def system_id(made):
+    return made.system_prompt.id_ if made.system_prompt is not None else None
 
 
-class TestAsyncConcurrency:
-    def test_concurrent_adds_run_one_at_a_time_in_the_order_they_were_started(self):
-        summarizer = FakeSummarizer()
-        manager = ShortTermMemoryManager(InMemoryStorage(), policy=LastNPolicy(2),
-                                         compaction=RollingCompaction(summarizer))
-        entries = notes(*"abcdef")
+class TestSystemPrompt:
+    def test_without_one_there_is_none(self):
+        made = manager()
+        made.add(note("a"))
+        assert system_id(made) is None
+        assert ids(made.active) == ["a"]
 
-        async def session():
-            await asyncio.gather(*(manager.add_async(entry) for entry in entries))
+    def test_the_latest_leads_what_goes_to_the_model(self):
+        made = opened(note("a"), summary("Earlier: a."), system("s"), note("b"))
+        assert ids(made.active)[0] == "s"
+        assert made.active[1].payload == Summary(text="Earlier: a.")
 
-        asyncio.run(session())
-        assert texts([e for e in manager.entries if not isinstance(e, SummaryEntry)]) == list("abcdef")
-        assert texts(manager.window) == ["e", "f"]
-        assert [call[0] for call in summarizer.calls] == [["a"], ["b"], ["c"], ["d"]]  # one drop per add, in order
+    def test_a_new_one_replaces_the_previous_which_stays_in_the_history(self):
+        made = manager()
+        for entry in (system("s1"), note("a"), system("s2"), note("b")):
+            made.add(entry)
+        assert system_id(made) == "s2"
+        assert ids(made.active) == ["s2", "a", "b"]
+        assert ids(made.entries) == ["s1", "a", "s2", "b"]
 
-    def test_an_add_and_a_compact_started_together_do_not_interleave(self):
-        manager = ShortTermMemoryManager(InMemoryStorage(), compaction=RollingCompaction(FakeSummarizer()))
-        for entry in notes("a", "b"):
-            manager.add(entry)
+    def test_the_policy_never_sees_them_so_they_are_never_dropped_or_summarized(self):
+        made, recorder = summarizing(LastNPolicy(2))
+        made.add(system("s", "You plan trips."))
+        for name in "abcd":
+            made.add(note(name))
+        assert ids(made.window) == ["c", "d"]
+        assert ids(made.active)[0] == "s"
+        assert recorder.texts and all("You plan trips." not in text for text in recorder.texts)
 
-        async def session():
-            await asyncio.gather(manager.compact_async(), manager.add_async(ContextEntry(text="c")))
+    def test_a_system_prompt_cannot_be_pinned(self):
+        made = manager(session_id="trip")
+        with pytest.raises(ValueError, match="system prompts are kept by rule"):
+            made.add(system("s"), pinned=True)
+        assert made.storage.entries("trip") == []
 
-        asyncio.run(session())
-        assert texts(manager.window) == ["c"] and covered(manager) == [e.id_ for e in manager.entries[:2]]
+    def test_removing_the_latest_brings_back_the_one_before(self):
+        made = manager()
+        made.add(system("s1"))
+        made.add(system("s2"))
+        made.remove("s2")
+        assert system_id(made) == "s1"
+        made.remove("s1")
+        assert system_id(made) is None
+
+    def test_removing_an_older_one_changes_nothing(self):
+        made = manager()
+        made.add(system("s1"))
+        made.add(system("s2"))
+        made.remove("s1")
+        assert system_id(made) == "s2"
+
+    def test_a_session_opened_again_knows_the_latest(self):
+        assert system_id(opened(system("s1"), note("a"), system("s2"), note("b"))) == "s2"
+
+    def test_a_rewind_to_before_the_latest_brings_back_the_one_before(self):
+        made = manager()
+        for entry in (system("s1"), note("a"), system("s2"), note("b")):
+            made.add(entry)
+        made.rewind("a")
+        assert system_id(made) == "s1"
+        assert ids(made.active) == ["s1", "a"]
+
+
+
+class TestSummaryKeeper:
+    def test_without_a_summarizer_it_refuses_to_summarize(self):
+        keeper = SummaryKeeper(InMemoryStorage(), "trip", None)
+        with pytest.raises(ValueError, match="this manager has no summarizer"):
+            keeper.summarize([note("a")])
+        with pytest.raises(ValueError, match="this manager has no summarizer"):
+            asyncio.run(keeper.summarize_async([note("a")]))
+        assert keeper.current is None

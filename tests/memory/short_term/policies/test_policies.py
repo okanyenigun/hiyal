@@ -1,265 +1,329 @@
+import asyncio
+import threading
+
 import pytest
 
 from hiyal.memory.short_term import (
-    ChainPolicy,
-    ContextEntry,
-    FullPolicy,
+    Context,
+    Entry,
+    EntryKind,
+    FilterPolicy,
     HeadTailPolicy,
+    KindFilterPolicy,
     LastNPolicy,
+    Policy,
     PredicateFilterPolicy,
+    Selection,
     SlidingWindowPolicy,
-    SummaryEntry,
     TokenWindowPolicy,
-    ToolResultEntry,
-    TypeFilterPolicy,
+    ToolResult,
+    WindowPolicy,
 )
-from hiyal.prompts import Image, UserPrompt
 from hiyal.utility import Tokens
 
 
-def numbered(count):
-    """Context entries whose text is their position, starting at 1."""
-    return [ContextEntry(text=str(number)) for number in range(1, count + 1)]
+def note(name):
+    """A context entry with ID ``name``."""
+    return Entry(id_=name, kind=EntryKind.CONTEXT, payload=Context(text=name))
 
 
-def texts(entries):
-    return [int(entry.text) for entry in entries]
+def result(name):
+    """A tool result entry with ID ``name``."""
+    return Entry(id_=name, kind=EntryKind.TOOL_RESULT,
+                 payload=ToolResult(message_id="m", name="search", arguments={}, output=name))
 
 
-class TestFullPolicy:
-    def test_everything_is_active(self):
-        entries = numbered(5)
-        assert FullPolicy().select(entries) == entries
+def ids(entries):
+    return [entry.id_ for entry in entries]
 
-    def test_returns_a_new_list(self):
-        entries = numbered(3)
-        assert FullPolicy().select(entries) is not entries
+
+def conversation():
+    """q1 t1 q2 t2 q3 t3: questions as context entries, each followed by a tool result."""
+    return [entry for n in (1, 2, 3) for entry in (note(f"q{n}"), result(f"t{n}"))]
+
+
+def entries(count):
+    return [note(f"e{index}") for index in range(count)]
+
+
+NO_TOOLS = [EntryKind.TOOL_RESULT]
+
+
+@pytest.fixture(params=["sync", "async"])
+def choose(request):
+    """A test taking ``choose`` runs twice: once with ``choose``, once with ``choose_async``."""
+
+    def run(policy, entries):
+        if request.param == "sync":
+            return policy.choose(entries)
+        return asyncio.run(policy.choose_async(entries))
+
+    return run
+
+
+class TestChain:
+    def test_then_returns_the_first_policy(self):
+        first = KindFilterPolicy(exclude=NO_TOOLS)
+        assert first.then(LastNPolicy(2)) is first
+
+    def test_a_filter_then_a_window(self, choose):
+        chosen = choose(KindFilterPolicy(exclude=NO_TOOLS).then(LastNPolicy(2)), conversation())
+        assert ids(chosen.kept) == ["q2", "q3"]
+        assert ids(chosen.too_old) == ["q1"]
+        assert ids(chosen.unwanted) == ["t1", "t2", "t3"]
+
+    def test_a_window_then_a_filter_is_another_choice(self, choose):
+        chosen = choose(LastNPolicy(2).then(KindFilterPolicy(exclude=NO_TOOLS)), conversation())
+        assert ids(chosen.kept) == ["q3"]
+        assert ids(chosen.too_old) == ["q1", "t1", "q2", "t2"]
+        assert ids(chosen.unwanted) == ["t3"]
+
+    def test_drops_from_several_steps_keep_the_history_order(self, choose):
+        chain = LastNPolicy(5).then(KindFilterPolicy(exclude=NO_TOOLS)).then(LastNPolicy(1))
+        chosen = choose(chain, conversation())
+        assert ids(chosen.kept) == ["q3"]
+        assert ids(chosen.too_old) == ["q1", "q2"]
+        assert ids(chosen.unwanted) == ["t1", "t2", "t3"]
+
+    def test_a_policy_alone_is_a_chain(self, choose):
+        given = entries(3)
+        assert choose(LastNPolicy(5), given) == Selection(kept=given, too_old=[], unwanted=[])
+
+    def test_the_entries_given_are_not_changed(self, choose):
+        given = conversation()
+        before = list(given)
+        choose(KindFilterPolicy(exclude=NO_TOOLS).then(LastNPolicy(1)), given)
+        assert given == before
+
+    def test_a_policy_already_in_the_chain_is_refused(self):
+        a, b = LastNPolicy(5), LastNPolicy(3)
+        with pytest.raises(ValueError, match="only once"):
+            a.then(a)
+        a.then(b)
+        with pytest.raises(ValueError, match="only once"):
+            a.then(b)
+        with pytest.raises(ValueError, match="only once"):
+            b.then(a)
+
+    def test_only_policies_can_be_linked(self):
+        with pytest.raises(TypeError, match="not a str"):
+            LastNPolicy(1).then("LastNPolicy(2)")  # type: ignore[arg-type]
+
+    def test_a_policy_that_adds_or_reorders_entries_is_refused(self, choose):
+        class Reverse(WindowPolicy):
+            def select(self, entries):
+                return entries[::-1]
+
+        class Invent(WindowPolicy):
+            def select(self, entries):
+                return [*entries, note("new")]
+
+        class Twice(WindowPolicy):
+            def select(self, entries):
+                return [entries[0], entries[0]]
+
+        class Copies(WindowPolicy):
+            def select(self, entries):
+                return [entry.model_copy() for entry in entries]  # equal, but not the entries given
+
+        for policy in (Reverse(), Invent(), Twice(), Copies()):
+            with pytest.raises(ValueError, match="a policy only selects"):
+                choose(policy, entries(3))
+
+    def test_a_linked_chain_is_added_whole(self, choose):
+        first, second, third = KindFilterPolicy(exclude=NO_TOOLS), LastNPolicy(2), LastNPolicy(1)
+        assert first.then(second.then(third)) is first
+        chosen = choose(first, conversation())
+        assert ids(chosen.kept) == ["q3"] and ids(chosen.too_old) == ["q1", "q2"]
+
+    @pytest.mark.parametrize("policy", [
+        KindFilterPolicy(exclude=NO_TOOLS), PredicateFilterPolicy(lambda entry: True), LastNPolicy(2),
+        SlidingWindowPolicy(size=2, step=1), HeadTailPolicy(head=1, tail=1), TokenWindowPolicy(10),
+    ], ids=lambda policy: type(policy).__name__)
+    def test_no_entries_give_an_empty_choice(self, choose, policy):
+        assert choose(policy, []) == Selection(kept=[], too_old=[], unwanted=[])
+
+    def test_a_policy_may_keep_nothing(self, choose):
+        chosen = choose(KindFilterPolicy(exclude=[EntryKind.CONTEXT, EntryKind.TOOL_RESULT]), conversation())
+        assert chosen.kept == [] and ids(chosen.unwanted) == ids(conversation())
+
+    def test_a_policy_must_be_a_filter_or_a_window(self, choose):
+        class Neither(Policy):
+            def select(self, entries):
+                return entries
+
+        with pytest.raises(TypeError, match="must be a FilterPolicy or a WindowPolicy"):
+            choose(Neither(), entries(2))
+
+    def test_by_default_select_async_runs_select_directly(self):
+        class Threads(WindowPolicy):
+            def __init__(self):
+                self.threads = []
+
+            def select(self, entries):
+                self.threads.append(threading.get_ident())
+                return entries
+
+        policy = Threads()
+        asyncio.run(policy.choose_async(entries(2)))
+        assert policy.threads == [threading.get_ident()]
+
+    def test_a_policy_can_wait_in_its_own_select_async(self):
+        class NoToolsLater(FilterPolicy):
+            def select(self, entries):
+                raise AssertionError("the async chain runs select_async")
+
+            async def select_async(self, entries):
+                await asyncio.sleep(0)
+                return [entry for entry in entries if entry.kind != EntryKind.TOOL_RESULT]
+
+        chosen = asyncio.run(NoToolsLater().then(LastNPolicy(2)).choose_async(conversation()))
+        assert ids(chosen.kept) == ["q2", "q3"]
+        assert ids(chosen.too_old) == ["q1"]
+        assert ids(chosen.unwanted) == ["t1", "t2", "t3"]
+
+
+class TestKindFilterPolicy:
+    def test_entries_of_the_excluded_kinds_are_dropped(self):
+        assert ids(KindFilterPolicy(exclude=NO_TOOLS).select(conversation())) == ["q1", "q2", "q3"]
+
+    def test_kinds_can_be_given_by_value(self):
+        assert KindFilterPolicy(exclude=["tool_result"]).exclude == {EntryKind.TOOL_RESULT}
+
+    def test_exclude_can_be_any_iterable_and_repeats_are_fine(self):
+        policy = KindFilterPolicy(exclude=(kind for kind in ["tool_result", EntryKind.TOOL_RESULT, "context"]))
+        assert policy.exclude == {EntryKind.TOOL_RESULT, EntryKind.CONTEXT}
+
+    def test_an_empty_or_unknown_exclude_is_refused(self):
+        with pytest.raises(ValueError, match="at least one entry kind"):
+            KindFilterPolicy(exclude=[])
+        with pytest.raises(ValueError, match="'tool'"):
+            KindFilterPolicy(exclude=["tool"])
+
+
+class TestPredicateFilterPolicy:
+    def test_entries_keep_says_yes_to_are_kept(self):
+        policy = PredicateFilterPolicy(lambda entry: entry.id_.endswith("2"))
+        assert ids(policy.select(conversation())) == ["q2", "t2"]
+
+    def test_any_truthy_answer_keeps(self):
+        policy = PredicateFilterPolicy(lambda entry: {"q1": 1, "q2": "yes", "q3": []}.get(entry.id_, 0))
+        assert ids(policy.select(conversation())) == ["q1", "q2"]
+
+    def test_keep_must_be_callable(self):
+        with pytest.raises(TypeError, match="keep must be callable"):
+            PredicateFilterPolicy("q2")  # type: ignore[arg-type]
 
 
 class TestLastNPolicy:
-    def test_keeps_the_last_n(self):
-        assert texts(LastNPolicy(3).select(numbered(10))) == [8, 9, 10]
+    def test_the_last_n_are_kept(self):
+        assert ids(LastNPolicy(2).select(entries(5))) == ["e3", "e4"]
 
-    def test_fewer_entries_than_n(self):
-        assert texts(LastNPolicy(5).select(numbered(2))) == [1, 2]
+    def test_fewer_than_n_are_all_kept(self):
+        assert ids(LastNPolicy(5).select(entries(2))) == ["e0", "e1"]
 
-    def test_empty_history(self):
-        assert LastNPolicy(5).select([]) == []
-
-    @pytest.mark.parametrize("n", [0, -1, 2.5, True, "3"])
+    @pytest.mark.parametrize("n", [0, -1, 1.5])
     def test_n_must_be_a_positive_integer(self, n):
-        with pytest.raises(ValueError, match="positive integer"):
+        with pytest.raises(ValueError, match="n must be a positive integer"):
             LastNPolicy(n)
 
 
 class TestSlidingWindowPolicy:
-    @pytest.mark.parametrize("count, first", [(250, 1), (251, 51), (300, 51), (301, 101), (351, 151)])
-    def test_the_docstring_example(self, count, first):
-        active = SlidingWindowPolicy(size=250, step=50).select(numbered(count))
-        assert texts(active)[0] == first and texts(active)[-1] == count
+    @pytest.mark.parametrize("count, start", [(3, 0), (4, 0), (5, 2), (6, 2), (7, 4)])
+    def test_the_start_moves_in_steps(self, count, start):
+        policy = SlidingWindowPolicy(size=4, step=2)
+        assert policy.start(count) == start
+        assert ids(policy.select(entries(count))) == [f"e{index}" for index in range(start, count)]
 
-    def test_never_more_than_size(self):
-        policy = SlidingWindowPolicy(size=10, step=3)
-        assert all(len(policy.select(numbered(count))) <= 10 for count in range(40))
+    def test_step_cannot_be_larger_than_size(self):
+        with pytest.raises(ValueError, match="cannot be larger than size"):
+            SlidingWindowPolicy(size=2, step=3)
 
-    def test_start_moves_only_in_steps(self):
-        policy = SlidingWindowPolicy(size=10, step=4)
-        starts = [policy.start(count) for count in range(30)]
-        assert set(starts) == {0, 4, 8, 12, 16, 20}
-        assert starts == sorted(starts)
-
-    def test_step_one_behaves_like_last_n(self):
-        window, last = SlidingWindowPolicy(size=7, step=1), LastNPolicy(7)
-        for count in range(20):
-            entries = numbered(count)
-            assert window.select(entries) == last.select(entries)
-
-    def test_step_equal_to_size_jumps_a_whole_window(self):
-        policy = SlidingWindowPolicy(size=5, step=5)
-        assert texts(policy.select(numbered(6))) == [6]
-        assert texts(policy.select(numbered(10))) == [6, 7, 8, 9, 10]
+    @pytest.mark.parametrize("count, start", [(4, 0), (5, 4), (8, 4), (9, 8)])
+    def test_a_step_as_large_as_the_size_drops_the_whole_window(self, count, start):
+        assert SlidingWindowPolicy(size=4, step=4).start(count) == start
 
     @pytest.mark.parametrize("size, step, message", [
-        (0, 1, "size must be"), (5, 0, "step must be"), (5, 6, "cannot be larger"), (5, 1.5, "step must be"),
+        (0, 1, "size must be a positive integer"), (2, 0, "step must be a positive integer"),
+        (2.5, 1, "size must be a positive integer"),
     ])
-    def test_invalid_settings(self, size, step, message):
+    def test_size_and_step_must_be_positive_integers(self, size, step, message):
         with pytest.raises(ValueError, match=message):
             SlidingWindowPolicy(size=size, step=step)
 
 
-class TestTypeFilterPolicy:
-    def test_removes_excluded_types_and_keeps_the_order(self):
-        question = UserPrompt(text="q")
-        context = ContextEntry(text="c")
-        result = ToolResultEntry(message_id="m", name="f", arguments={}, output=1)
-        summary = SummaryEntry(text="s", covers_through="x", covers_count=1)
-        policy = TypeFilterPolicy(exclude=[ToolResultEntry, SummaryEntry])
-        assert policy.select([question, result, context, summary]) == [question, context]
-
-    def test_exclude_cannot_be_empty(self):
-        with pytest.raises(ValueError, match="at least one"):
-            TypeFilterPolicy(exclude=[])
-
-
-class TestPredicateFilterPolicy:
-    def test_keeps_what_the_function_says_yes_to_in_order(self):
-        policy = PredicateFilterPolicy(lambda entry: int(entry.text) % 2 == 1)
-        assert texts(policy.select(numbered(6))) == [1, 3, 5]
-
-    def test_is_a_filter(self):
-        policy = PredicateFilterPolicy(lambda entry: int(entry.text) > 2)
-        assert policy.is_filter and texts(policy.filter(numbered(4))) == [3, 4]
-
-    def test_runs_before_a_window_in_a_chain(self):
-        chain = ChainPolicy([LastNPolicy(2), PredicateFilterPolicy(lambda entry: int(entry.text) % 2 == 1)])
-        assert texts(chain.select(numbered(8))) == [5, 7]
-
-    def test_keep_must_be_callable(self):
-        with pytest.raises(TypeError, match="callable"):
-            PredicateFilterPolicy("odd")
-
-
 class TestHeadTailPolicy:
-    def test_keeps_the_head_and_the_tail(self):
-        assert texts(HeadTailPolicy(head=2, tail=3).select(numbered(10))) == [1, 2, 8, 9, 10]
+    def test_the_first_and_the_last_entries_are_kept(self):
+        assert ids(HeadTailPolicy(head=1, tail=2).select(entries(5))) == ["e0", "e3", "e4"]
 
-    def test_short_history_is_kept_whole(self):
-        assert texts(HeadTailPolicy(head=2, tail=3).select(numbered(5))) == [1, 2, 3, 4, 5]
+    def test_with_no_more_than_head_and_tail_all_are_kept(self):
+        assert ids(HeadTailPolicy(head=1, tail=2).select(entries(3))) == ["e0", "e1", "e2"]
 
-    def test_is_a_window(self):
-        policy = HeadTailPolicy(head=1, tail=1)
-        assert not policy.is_filter and texts(policy.filter(numbered(4))) == [1, 2, 3, 4]
+    def test_head_and_tail_must_be_positive_integers(self):
+        with pytest.raises(ValueError, match="head must be a positive integer"):
+            HeadTailPolicy(head=0, tail=2)
+        with pytest.raises(ValueError, match="tail must be a positive integer"):
+            HeadTailPolicy(head=1, tail=-1)
 
-    @pytest.mark.parametrize("settings", [{"head": 0, "tail": 2}, {"head": 2, "tail": -1}, {"head": True, "tail": 2}])
-    def test_head_and_tail_must_be_positive_integers(self, settings):
-        with pytest.raises(ValueError, match="positive integer"):
-            HeadTailPolicy(**settings)
+    def test_one_more_than_head_and_tail_drops_one(self):
+        assert ids(HeadTailPolicy(head=1, tail=2).select(entries(4))) == ["e0", "e2", "e3"]
 
 
 def sized(*sizes):
-    """Context entries numbered from 1, each ``size`` words long as ``count_words`` counts their text."""
-    return [ContextEntry(text=" ".join([str(number), *["w"] * (size - 2)]))
-            for number, size in enumerate(sizes, 1)]
+    """Entries whose text is their size, for ``by_text``."""
+    return [note(str(size)) for size in sizes]
 
 
-def labels(entries):
-    return [int(entry.text.split()[0]) for entry in entries]
+def by_text(entry):
+    return int(entry.payload.text)
 
 
 class TestTokenWindowPolicy:
-    @pytest.fixture(autouse=True)
-    def count_words(self, monkeypatch):
-        """Count words instead of tokens, so no test loads a tiktoken encoding (that needs network)."""
-        monkeypatch.setattr(Tokens, "count", staticmethod(lambda text, encoding="o200k_base": len(text.split())))
-
-    def test_within_max_tokens_nothing_leaves(self):
-        assert labels(TokenWindowPolicy(12, 6).select(sized(3, 3, 3, 3))) == [1, 2, 3, 4]
+    def test_nothing_is_cut_within_max_tokens(self):
+        assert ids(TokenWindowPolicy(25, 10, count=by_text).select(sized(10, 10))) == ["10", "10"]
 
     def test_passing_max_tokens_cuts_down_to_target_tokens(self):
-        assert labels(TokenWindowPolicy(12, 6).select(sized(3, 3, 3, 3, 3))) == [4, 5]
-
-    def test_the_start_stays_put_between_cuts(self):
-        policy, entries = TokenWindowPolicy(12, 6), sized(*[3] * 8)
-        assert labels(policy.select(entries[:7])) == [4, 5, 6, 7]  # 12 tokens: no cut yet
-        assert labels(policy.select(entries)) == [7, 8]
-
-    def test_chosen_add_by_add_it_matches_choosing_from_the_whole_history(self):
-        policy = TokenWindowPolicy(12, 5)
-        entries = sized(3, 5, 2, 7, 4, 2, 2, 9, 3, 15, 2, 4, 6, 3, 2, 2, 5)
-        window = []
-        for count, entry in enumerate(entries, 1):
-            window = policy.select([*window, entry])
-            assert window == policy.select(entries[:count])
+        given = [note("10"), note("11"), note("12")]
+        policy = TokenWindowPolicy(25, 12, count=by_text)
+        # 10, 21, then 33 > 25: drop 10 (23 > 12), drop 11 (12): only the newest is left.
+        assert ids(policy.select(given)) == ["12"]
+        # The start stays while the window grows again: 12 + 13 = 25.
+        assert ids(policy.select([*given, note("13")])) == ["12", "13"]
 
     def test_the_newest_entry_stays_even_alone_over_max_tokens(self):
-        policy = TokenWindowPolicy(12, 6)
-        assert labels(policy.select(sized(3, 20))) == [2]
-        assert labels(policy.select(sized(3, 20, 3))) == [3]
+        assert ids(TokenWindowPolicy(25, count=by_text).select(sized(5, 40))) == ["40"]
 
-    def test_the_target_defaults_to_half(self):
-        assert TokenWindowPolicy(100).target_tokens == 50
+    def test_target_tokens_defaults_to_half(self):
+        assert TokenWindowPolicy(25).target_tokens == 12
 
-    def test_attached_media_count_their_estimate(self):
-        photo = UserPrompt(text="1", images=[Image(data=b"\x89PNG\r\n\x1a\n", mime_type="image/png")])
-        entries = [photo, *sized(3, 3)[1:]]
-        assert TokenWindowPolicy(100, 10).select(entries) == entries[1:]  # the image's 256 passes 100
-        assert TokenWindowPolicy(100, 10, media_tokens={}).select(entries) == entries  # a few words only
+    def test_target_tokens_is_at_least_1(self):
+        assert TokenWindowPolicy(1).target_tokens == 1
 
-    def test_is_a_window(self):
-        assert not TokenWindowPolicy(10).is_filter
+    def test_reaching_max_tokens_exactly_is_not_passing_it(self):
+        assert ids(TokenWindowPolicy(20, 5, count=by_text).select(sized(10, 10))) == ["10", "10"]
 
-    @pytest.mark.parametrize("settings, message", [
-        ({"max_tokens": 0}, "max_tokens must be a positive integer"),
-        ({"max_tokens": 10, "target_tokens": 0}, "target_tokens must be a positive integer"),
-        ({"max_tokens": 10, "target_tokens": 11}, "cannot be larger than max_tokens"),
-        ({"max_tokens": 10, "encoding": "nope"}, "unknown encoding"),
-        ({"max_tokens": 10, "media_tokens": {"images": 1}}, "media_tokens keys"),
-    ])
-    def test_invalid_settings(self, settings, message):
-        with pytest.raises(ValueError, match=message):
-            TokenWindowPolicy(**settings)
+    def test_a_cut_stops_as_soon_as_the_window_is_down_to_target_tokens(self):
+        # 5, 10, 20, then 30 > 25: drop 5 (25), drop 5 (20 = target): the rest stay.
+        assert ids(TokenWindowPolicy(25, 20, count=by_text).select(sized(5, 5, 10, 10))) == ["10", "10"]
 
+    def test_target_equal_to_max_trims_just_enough(self):
+        # 10, 20, then 30 > 20: drop one 10 (20); then 30 again: drop the next.
+        assert ids(TokenWindowPolicy(20, 20, count=by_text).select(sized(10, 10, 10, 10))) == ["10", "10"]
 
-class TestChainPolicy:
-    @staticmethod
-    def mixed():
-        """Twenty entries: every fourth is a tool result."""
-        return [ToolResultEntry(message_id="m", name="f", arguments={}, output=n) if n % 4 == 0 else ContextEntry(text=str(n))
-                for n in range(1, 21)]
+    def test_entries_counted_as_0_never_cause_a_cut(self):
+        assert len(TokenWindowPolicy(1, count=lambda entry: 0).select(entries(50))) == 50
 
-    def test_filter_then_window_gives_a_full_window(self):
-        chain = ChainPolicy([TypeFilterPolicy(exclude=[ToolResultEntry]), LastNPolicy(5)])
-        assert texts(chain.select(self.mixed())) == [14, 15, 17, 18, 19]
+    def test_by_default_entries_are_counted_by_their_text(self, monkeypatch):
+        monkeypatch.setattr(Tokens, "count", staticmethod(lambda text, encoding="o200k_base": len(text.split())))
+        # Each context entry reads "Context:" and one word: 2 tokens; 6 > 5 cuts down to 2.
+        assert ids(TokenWindowPolicy(5, 2).select(entries(3))) == ["e2"]
 
-    def test_filters_run_first_whatever_the_order(self):
-        chain = ChainPolicy([LastNPolicy(5), TypeFilterPolicy(exclude=[ToolResultEntry])])
-        assert texts(chain.select(self.mixed())) == [14, 15, 17, 18, 19]
-        assert [type(policy) for policy in chain.policies] == [TypeFilterPolicy, LastNPolicy]
-
-    def test_filters_and_windows_each_keep_their_order(self):
-        first, second = TypeFilterPolicy(exclude=[ToolResultEntry]), TypeFilterPolicy(exclude=[SummaryEntry])
-        wide, narrow = LastNPolicy(6), LastNPolicy(2)
-        chain = ChainPolicy([wide, first, narrow, second])
-        assert chain.policies == [first, second, wide, narrow]
-
-    def test_which_policies_are_filters(self):
-        assert TypeFilterPolicy(exclude=[ToolResultEntry]).is_filter and FullPolicy().is_filter
-        assert not LastNPolicy(3).is_filter and not SlidingWindowPolicy(5, 2).is_filter
-        assert ChainPolicy([FullPolicy(), TypeFilterPolicy(exclude=[ToolResultEntry])]).is_filter
-        assert not ChainPolicy([FullPolicy(), LastNPolicy(3)]).is_filter
-
-    def test_a_single_policy_chain_is_that_policy(self):
-        entries = numbered(10)
-        assert ChainPolicy([LastNPolicy(3)]).select(entries) == LastNPolicy(3).select(entries)
-
-    def test_chains_can_be_nested(self):
-        inner = ChainPolicy([LastNPolicy(6)])
-        assert texts(ChainPolicy([inner, LastNPolicy(2)]).select(numbered(10))) == [9, 10]
-
-    def test_needs_at_least_one_policy(self):
-        with pytest.raises(ValueError, match="at least one policy"):
-            ChainPolicy([])
-
-
-@pytest.mark.parametrize("policy", [
-    FullPolicy(), LastNPolicy(3), SlidingWindowPolicy(5, 2), TypeFilterPolicy([SummaryEntry]),
-    ChainPolicy([FullPolicy(), LastNPolicy(2)]),
-], ids=lambda policy: type(policy).__name__)
-def test_no_policy_changes_its_input(policy):
-    entries = numbered(10)
-    before = list(entries)
-    policy.select(entries)
-    assert entries == before
-
-
-
-class TestFilterPart:
-    def test_a_filter_keeps_its_choice_a_window_keeps_everything(self):
-        entries = [UserPrompt(text="1"), ContextEntry(text="2"), UserPrompt(text="3")]
-        assert texts(TypeFilterPolicy(exclude=[ContextEntry]).filter(entries)) == [1, 3]
-        assert texts(LastNPolicy(1).filter(entries)) == [1, 2, 3]
-
-    def test_a_chain_runs_only_its_filters(self):
-        entries = [UserPrompt(text="1"), ContextEntry(text="2"), UserPrompt(text="3")]
-        chain = ChainPolicy([LastNPolicy(1), TypeFilterPolicy(exclude=[ContextEntry])])
-        assert texts(chain.filter(entries)) == [1, 3]  # the window cuts nothing here
+    def test_invalid_settings_are_refused(self):
+        with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
+            TokenWindowPolicy(0)
+        with pytest.raises(ValueError, match="target_tokens must be a positive integer"):
+            TokenWindowPolicy(10, 0)
+        with pytest.raises(ValueError, match="cannot be larger than max_tokens"):
+            TokenWindowPolicy(10, 20)
+        with pytest.raises(TypeError, match="count must be callable"):
+            TokenWindowPolicy(10, count=5)  # type: ignore[arg-type]
