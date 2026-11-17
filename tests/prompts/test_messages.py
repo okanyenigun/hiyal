@@ -18,6 +18,16 @@ class TestPrompts:
         with pytest.raises(ValidationError):
             UserPrompt(text=None)
 
+    def test_every_prompt_gets_its_own_generated_id(self):
+        prompts = [Prompt(text="x"), SystemPrompt(text="x"), UserPrompt(text="x"), UserPrompt(text="x")]
+        ids = [prompt.id_ for prompt in prompts]
+        assert all(ids) and len(set(ids)) == len(ids)
+
+    def test_given_id_is_kept_but_empty_id_is_rejected(self):
+        assert UserPrompt(text="x", id_="p1").id_ == "p1"
+        with pytest.raises(ValidationError):
+            UserPrompt(text="x", id_="")
+
     def test_text_only_prompt_has_no_media(self):
         prompt = UserPrompt(text="hi")
         assert (prompt.images, prompt.audio, prompt.documents) == ([], [], [])

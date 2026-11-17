@@ -165,6 +165,41 @@ class TestMediaHelpers:
         assert target.read_bytes() == PNG
 
 
+class TestPlaceholder:
+    def test_without_a_description(self):
+        image = Image(mime_type="image/png", data=b"x", filename="chart.png")
+        assert image.description is None
+        assert image.placeholder() == "[image: chart.png (image/png)]"
+
+    @pytest.mark.parametrize("media, kind", [
+        (Image(mime_type="image/png", data=b"x", filename="a.png"), "image"),
+        (Document(mime_type="application/pdf", data=b"x", filename="a.pdf"), "document"),
+        (Audio(mime_type="audio/wav", data=b"x", filename="a.wav"), "audio"),
+    ])
+    def test_every_kind_shows_its_description(self, media, kind):
+        media.description = "  Monthly sales, peaking in May  "
+        assert media.placeholder() == f"[{kind}: {media.name} ({media.mime_type}): Monthly sales, peaking in May]"
+
+    def test_a_blank_description_is_left_out(self):
+        image = Image(mime_type="image/png", data=b"x", filename="a.png", description="   ")
+        assert image.placeholder() == "[image: a.png (image/png)]"
+
+    def test_audio_shows_its_transcript(self):
+        audio = Audio(mime_type="audio/wav", data=b"x", filename="a.wav", transcript="Hello there.")
+        assert audio.placeholder() == "[audio: a.wav (audio/wav): transcript: Hello there.]"
+
+    def test_audio_shows_the_description_then_the_transcript(self):
+        audio = Audio(mime_type="audio/wav", data=b"x", filename="a.wav",
+                      description="A voice message from the hotel", transcript="Check-in is at 3.")
+        assert audio.placeholder() == (
+            "[audio: a.wav (audio/wav): A voice message from the hotel; transcript: Check-in is at 3.]"
+        )
+
+    def test_the_description_survives_json(self):
+        image = Image(mime_type="image/png", data=PNG, description="A booking confirmation")
+        assert Image.model_validate_json(image.model_dump_json()).description == "A booking confirmation"
+
+
 class TestCoerce:
     def test_media_objects_pass_through(self):
         image = Image(mime_type="image/png", data=b"x")
@@ -201,9 +236,11 @@ class TestAudioToWav:
     def test_pcm_becomes_wav_with_rate_and_channels_from_the_mime_type(self):
         pcm = b"\x01\x00\x02\x00" * 10
         audio = Audio(mime_type="audio/L16; rate=16000; channels=2", data=pcm,
-                      transcript="hi", filename="speech.pcm")
+                      transcript="hi", description="a greeting", filename="speech.pcm")
         wav_audio = audio.to_wav()
-        assert (wav_audio.mime_type, wav_audio.transcript, wav_audio.filename) == ("audio/wav", "hi", "speech.wav")
+        assert (wav_audio.mime_type, wav_audio.transcript, wav_audio.description, wav_audio.filename) == (
+            "audio/wav", "hi", "a greeting", "speech.wav"
+        )
         with wave.open(io.BytesIO(wav_audio.data)) as wav:
             assert (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) == (2, 2, 16000)
             assert wav.readframes(wav.getnframes()) == pcm

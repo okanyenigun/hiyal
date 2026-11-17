@@ -241,7 +241,7 @@ class TestResponsesParsing:
             ("get_weather", {"city": "Istanbul"}, "complete"), ("get_weather", None, "invalid"),
             ("get_weather", {}, "complete"), ("get_weather", None, "incomplete")]
         assert calls[1].issue.code == "invalid_json"
-        assert calls[0].raw.call_id == "call_0" and [m.id for m in result.messages] == ["fc_0", "fc_1", "fc_2", "fc_3"]
+        assert calls[0].raw["call_id"] == "call_0" and [m.id for m in result.messages] == ["fc_0", "fc_1", "fc_2", "fc_3"]
 
     def test_absent_item_status_uses_the_response_status(self, llm):
         done = parse(llm, openai_response([openai_function_call(status=None)]))
@@ -284,7 +284,7 @@ class TestResponsesParsing:
 
     def test_raw_is_kept(self, llm):
         raw = Response.model_validate(openai_response([openai_message()]))
-        assert llm.translator.parse_response(raw).raw is raw
+        assert llm.translator.parse_response(raw).raw == raw.model_dump(mode="json")
 
 
 class TestEdgeCases:
@@ -300,7 +300,13 @@ class TestEdgeCases:
         assert "reasoning" not in build_request(llm, thinking={"others": {}})
 
     def test_cancelled_events_with_and_without_a_response(self, llm):
-        from types import SimpleNamespace as N
+        from pydantic import BaseModel
+
+        class N(BaseModel):  # stands in for the SDK's cancelled event
+            type: str
+            sequence_number: int
+            response: Response | None
+
         cancelled = llm.translator.parse_stream_event(
             N(type="response.cancelled", sequence_number=4, response=None), response_id="r1")
         assert (cancelled.event_type, cancelled.status, cancelled.response, cancelled.response_id) == (

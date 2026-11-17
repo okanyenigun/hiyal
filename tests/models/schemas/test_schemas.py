@@ -43,9 +43,48 @@ NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 def response(*contents, **overrides):
     messages = [ResponseMessage(id=f"m{i}", role="assistant", content=content) for i, content in enumerate(contents)]
     values = {"text": "", "messages": messages, "provider": "openai", "id_": "r", "model": "m",
-              "created_at": NOW, "status": "completed", "raw": object()}
+              "created_at": NOW, "status": "completed", "raw": {"sdk": "object"}}
     values.update(overrides)
     return LLMResponse(**values)
+
+
+class TestResponseId:
+    def test_empty_response_id_is_rejected(self):
+        with pytest.raises(ValidationError):
+            response(id_="")
+
+    def test_image_output_survives_json(self):
+        png = b"\x89PNG\r\n\x1a\n\x00\xff\xfe\xfb"
+        content = ResponseContent(content_type="image", data={"mime_type": "image/png", "data": png})
+        reloaded = LLMResponse.model_validate_json(response(content).model_dump_json())
+        assert isinstance(reloaded.messages[0].content.data["data"], str)  # base64 after reloading
+        assert reloaded.images[0].data == png
+
+    def test_to_text_shows_text_tool_calls_and_media_but_not_reasoning(self):
+        png = b"\x89PNG\r\n\x1a\n"
+        result = response(
+            ResponseContent(content_type="reasoning", text="private thoughts"),
+            ResponseContent(content_type="text", text="Let me check."),
+            ToolCallContent(data=ToolCall(name="get_weather", arguments={"city": "Kyoto"},
+                                          status="complete", raw=None)),
+            ResponseContent(content_type="image", data={"mime_type": "image/png", "data": png}),
+            text="Let me check.",
+        )
+        assert result.to_text() == ('Assistant: Let me check.\nTool call: get_weather({"city": "Kyoto"})\n'
+                                    "[image: image.png (image/png)]")
+
+    def test_to_text_of_an_empty_response(self):
+        assert response().to_text() == "Assistant: (no output)"
+
+    def test_tool_calls_survive_json(self):
+        call = ToolCall(raw={"sdk": "object"}, name="get_weather", arguments={"city": "Kyoto"}, status="complete")
+        reloaded = LLMResponse.model_validate_json(response(ToolCallContent(data=call)).model_dump_json())
+        assert isinstance(reloaded.messages[0].content, ToolCallContent)
+        assert [(c.name, c.arguments, c.raw) for c in reloaded.tool_calls] == [("get_weather", {"city": "Kyoto"}, None)]
+
+    def test_has_no_input_link(self):
+        # Entries are linked by their order in a history, not by IDs.
+        assert "input_id" not in LLMResponse.model_fields
 
 
 class TestFields:

@@ -1,0 +1,59 @@
+import pytest
+
+from hiyal.memory.short_term import SingleCallSummarizer
+from hiyal.prompts.hub import PromptHub, hub
+
+
+@pytest.fixture
+def library(tmp_path):
+    (tmp_path / "memory" / "summarize").mkdir(parents=True)
+    (tmp_path / "memory" / "summarize" / "v1.md").write_text("First version.\n")
+    (tmp_path / "memory" / "summarize" / "v2.md").write_text("Second version.\n")
+    return PromptHub(tmp_path)
+
+
+class TestPromptHub:
+    def test_get_reads_a_version_without_surrounding_whitespace(self, library):
+        assert library.get("memory/summarize", "v2") == "Second version."
+
+    def test_versions_are_listed_sorted(self, library):
+        assert library.versions("memory/summarize") == ["v1", "v2"]
+        assert library.versions("nothing") == []
+
+    def test_an_unknown_prompt_or_version_says_what_exists(self, library):
+        with pytest.raises(ValueError, match="there is no prompt 'memory/other'"):
+            library.get("memory/other", "v1")
+        with pytest.raises(ValueError, match="has no version 'v9'; it has v1, v2"):
+            library.get("memory/summarize", "v9")
+
+    def test_the_shipped_summarize_prompt_is_there(self):
+        assert hub.get("memory/summarize", "v1").startswith("You summarize a conversation")
+
+    @pytest.mark.parametrize("name", ["memory/combine", "memory/shorten"])
+    def test_combine_and_shorten_v2_keep_the_v2_headings(self, name):
+        text = hub.get(name, "v2")
+        assert all(heading in text for heading in ["LANGUAGE", "INTENT", "SUMMARY", "TOOLS", "ARTIFACTS", "NEXT STEPS"])
+        assert 'Write "None"' in text and "plain, compact prose" not in text
+
+    def test_condense_notes_keeps_every_section(self):
+        assert "do not empty a section that has content" in hub.get("memory/condense_notes", "v1")
+
+    def test_summarize_with_notes_leaves_the_current_state_to_the_notes(self):
+        text = hub.get("memory/summarize_with_notes", "v1")
+        assert "Do not restate that state" in text
+        assert SingleCallSummarizer(None, prompt_name="memory/summarize_with_notes").instructions == text  # type: ignore[arg-type]
+
+    def test_summarize_v2_asks_for_fixed_headings(self):
+        v2 = hub.get("memory/summarize", "v2")
+        headings = ["LANGUAGE:", "INTENT:", "SUMMARY:", "TOOLS:", "ARTIFACTS:", "NEXT STEPS:"]
+        assert [v2.index(h) for h in headings] == sorted(v2.index(h) for h in headings)
+        assert 'Write "None"' in v2 and SingleCallSummarizer(None, prompt_version="v2").instructions == v2  # type: ignore[arg-type]
+
+
+class TestSummarizerUsesTheHub:
+    def test_by_default_the_hub_prompt(self):
+        assert SingleCallSummarizer(None).instructions == hub.get("memory/summarize", "v1")  # type: ignore[arg-type]
+
+    def test_another_version(self, monkeypatch, library):
+        monkeypatch.setattr("hiyal.memory.short_term.summarizers.single_call.hub", library)
+        assert SingleCallSummarizer(None, prompt_version="v2").instructions == "Second version."  # type: ignore[arg-type]

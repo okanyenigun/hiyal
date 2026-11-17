@@ -102,15 +102,15 @@ class TestStreamAccumulator:
     def test_adapt_counts_and_remembers_raw_events(self):
         accumulator = self.accumulator()
         assert accumulator.sequence_number == -1
-        [event] = accumulator.adapt("a")
-        assert (event.sequence_number, event.raw, event.provider, event.delta.text) == (0, "a", "openai", "a")
-        accumulator.adapt("b")
-        assert (accumulator.sequence_number, accumulator.raw) == (1, "b")
+        [event] = accumulator.adapt({"text": "a"})
+        assert (event.sequence_number, event.raw, event.provider, event.delta.text) == (0, {"text": "a"}, "openai", "a")
+        accumulator.adapt({"text": "b"})
+        assert (accumulator.sequence_number, accumulator.raw) == (1, {"text": "b"})
         assert list(accumulator.finalize()) == []
 
     def test_delta_turns_tool_calls_into_fragments(self):
         accumulator = self.accumulator()
-        accumulator.adapt("first")  # _delta runs inside adapt, after the counter moves
+        accumulator.adapt({"text": "first"})  # _delta runs inside adapt, after the counter moves
         call = ToolCall.normalize(name="f", arguments={"a": 1}, raw=None, complete=False)
         event = accumulator._delta(message_index=2, message_id="m2", content=ToolCallContent(data=call))
         assert isinstance(event.delta, ToolCallDeltaContent)
@@ -124,7 +124,7 @@ class TestStreamAccumulator:
         [event] = accumulator._terminal(parsed_response(status=status))
         assert (event.event_type, event.status, event.response_id) == (f"response.{status}", status, "r1")
         assert event.sequence_number is None
-        accumulator.adapt("x")
+        accumulator.adapt({"text": "x"})
         assert accumulator._terminal(parsed_response())[0].sequence_number == 0
 
 
@@ -271,6 +271,6 @@ class TestAsyncLLMStream:
 
 def test_accumulator_and_stream_work_together():
     accumulator = FakeAccumulator(translator=FakeTranslator(INFO), model="m")
-    stream = LLMStream(raw=iter(["a", "b"]), event_adapter=accumulator.adapt, finalizer=accumulator.finalize)
+    stream = LLMStream(raw=iter([{"text": "a"}, {"text": "b"}]), event_adapter=accumulator.adapt, finalizer=accumulator.finalize)
     assert [event.delta.text for event in stream] == ["a", "b"]
     assert ResponseContent(content_type="text", text="a")

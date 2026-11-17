@@ -1,7 +1,8 @@
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import Annotated, Any, Literal
 from .response import LLMResponse, ResponseContent, ResponseError
 from .types import Provider, ResponseStatus
+from ...utility import Raw
 
 
 class StreamEventBase(BaseModel):
@@ -27,11 +28,20 @@ class StreamEventBase(BaseModel):
         description="Provider response identifier when known.",
         examples=["resp_123"],
     )
-    raw: Any = Field(
+    raw: dict[str, Any] | None = Field(
         exclude=True,
         repr=False,
-        description="Original SDK event object; excluded from serialization.",
+        description=(
+            "The provider's original stream event as a JSON-compatible dict, "
+            "converted from the SDK object with model_dump(mode='json'); "
+            "excluded from serialization."
+        ),
     )
+
+    @field_validator("raw", mode="before")
+    @classmethod
+    def _raw_as_dict(cls, value: Any) -> dict[str, Any] | None:
+        return Raw.to_dict(value)
 
 
 class ContentDeltaEvent(StreamEventBase):

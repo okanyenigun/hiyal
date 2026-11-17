@@ -3,7 +3,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from hiyal.tools import ToolCall, ToolCallDelta, ToolCallIssue
 
-RAW = object()
+RAW = {"id": "fc_1"}
 
 
 def normalize(**overrides):
@@ -17,7 +17,7 @@ class TestNormalizeNames:
         call = normalize()
         assert (call.name, call.arguments, call.status, call.issue) == (
             "get_weather", {"city": "Istanbul"}, "complete", None)
-        assert call.raw is RAW
+        assert call.raw == RAW
 
     @pytest.mark.parametrize("name, code", [(None, "missing_name"), ("", "missing_name"),
                                             ("get weather", "invalid_name"), ("get\tweather", "invalid_name"),

@@ -5,6 +5,7 @@ from types import SimpleNamespace as N
 import pytest
 from openai._models import construct_type
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
+from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall, ChoiceDeltaToolCallFunction
 
 from hiyal.models.bases import LLMStream
 from hiyal.models.openai import ChatCompletionsTranslator, ChatContents
@@ -21,8 +22,10 @@ def message(content=None, reasoning=None, tool_calls=None, audio=None):
 
 
 def call(index=None, call_id=None, name=None, arguments=None):
-    function = None if name is None and arguments is None else N(name=name, arguments=arguments)
-    return N(index=index, id=call_id, function=function)
+    """An SDK tool call, built without validation so a test can leave fields empty (e.g. no index)."""
+    function = (None if name is None and arguments is None
+                else ChoiceDeltaToolCallFunction.model_construct(name=name, arguments=arguments))
+    return ChoiceDeltaToolCall.model_construct(index=index, id=call_id, function=function, type="function")
 
 
 class TestChatContents:
@@ -36,7 +39,7 @@ class TestChatContents:
         assert [c.text for c in final[:2]] == ["think", "Hello."]
         typed = final[2].data
         assert isinstance(final[2], ToolCallContent)
-        assert (typed.name, typed.arguments, typed.status, typed.raw.id) == ("f", {"a": 1}, "complete", "c1")
+        assert (typed.name, typed.arguments, typed.status, typed.raw["id"]) == ("f", {"a": 1}, "complete", "c1")
         assert len(set(contents.ids)) == 3 and all(i.startswith("item_") for i in contents.ids)
 
     def test_deltas_append_to_the_same_parts(self):
@@ -84,7 +87,7 @@ class TestChatContents:
 
     def test_tool_call_without_function(self):
         contents = ChatContents()
-        contents.apply(message(tool_calls=[N(index=0, id="c1", function=None)]))
+        contents.apply(message(tool_calls=[call(0, "c1")]))
         call_ = contents.final_contents(complete=True)[0].data
         assert (call_.name, call_.status, call_.issue.code) == (None, "invalid", "missing_name")
 
@@ -155,7 +158,7 @@ class TestChatParsing:
             {"id": "c2", "type": "function", "function": {"name": "g", "arguments": "oops"}}]})
         calls = parse(translator, payload).tool_calls
         assert [(c.name, c.arguments, c.status) for c in calls] == [("f", {}, "complete"), ("g", None, "invalid")]
-        assert calls[0].raw.id == "c1"
+        assert calls[0].raw["id"] == "c1"
 
     def test_cut_off_responses_keep_calls_incomplete(self, translator):
         payload = chat_completion({"tool_calls": [
@@ -186,6 +189,10 @@ def stream(translator, chunks):
 
 
 class TestChatStreaming:
+    def test_empty_chunk_id_gets_a_generated_id(self, translator):
+        *_, terminal = stream(translator, [{**chat_chunk({"content": "x"}, finish_reason="stop"), "id": ""}])
+        assert terminal.response.id_.startswith("chat_")
+
     def test_deltas_and_terminal_response_agree(self, translator):
         events = stream(translator, [
             chat_chunk({"role": "assistant", "reasoning_content": "hm", "content": "Hel"}),

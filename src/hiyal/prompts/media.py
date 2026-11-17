@@ -6,7 +6,7 @@ import mimetypes
 import wave
 from pathlib import Path
 from typing import ClassVar, Self
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Python's guesses that providers name differently.
 _MIME_OVERRIDES = {
@@ -30,6 +30,10 @@ def guess_mime_type(name: str) -> str | None:
 class Media(BaseModel):
     """One media item, given by exactly one source: bytes, a URL, or a file ID."""
 
+    # In JSON, bytes are written and read as base64; the default (UTF-8 text)
+    # fails for binary data such as images.
+    model_config = ConfigDict(ser_json_bytes="base64", val_json_bytes="base64")
+
     mime_type: str = Field(
         description="MIME type, e.g. 'image/png'.", examples=["image/png"]
     )
@@ -44,6 +48,13 @@ class Media(BaseModel):
     filename: str | None = Field(
         default=None,
         description="Original file name; some providers require one for inline files.",
+    )
+    description: str | None = Field(
+        default=None,
+        description=(
+            "The file in words, for a reader that cannot open it: what an image shows, "
+            "what a document says. Empty until someone fills it; shown by placeholder()."
+        ),
     )
 
     # Required MIME top-level type for subclasses ('image', 'audio'); None accepts any.
@@ -81,6 +92,20 @@ class Media(BaseModel):
         cls, data: bytes, mime_type: str, filename: str | None = None
     ) -> Self:
         return cls(data=data, mime_type=mime_type, filename=filename)
+
+    def placeholder(self) -> str:
+        """How the media is shown in plain text, with its text representation when it has one.
+
+        ``[image: chart.png (image/png)]``, or with a description
+        ``[image: chart.png (image/png): Monthly sales, peaking in May]``.
+        """
+        head = f"{type(self).__name__.lower()}: {self.name} ({self.mime_type})"
+        texts = self._texts()
+        return f"[{head}: {'; '.join(texts)}]" if texts else f"[{head}]"
+
+    def _texts(self) -> list[str]:
+        """The text representations ``placeholder()`` shows; non-blank only."""
+        return [self.description.strip()] if self.description and self.description.strip() else []
 
     @property
     def name(self) -> str:
@@ -153,6 +178,13 @@ class Audio(Media):
         default=None, description="What the audio says, when the provider returns it."
     )
 
+    def _texts(self) -> list[str]:
+        """The description, then the transcript: what the clip is, then what it says."""
+        texts = super()._texts()
+        if self.transcript and self.transcript.strip():
+            texts.append(f"transcript: {self.transcript.strip()}")
+        return texts
+
     @property
     def is_raw_pcm(self) -> bool:
         """Headerless 16-bit PCM (``audio/L16``, ``audio/pcm``), which players can't open."""
@@ -186,6 +218,7 @@ class Audio(Media):
             data=buffer.getvalue(),
             mime_type="audio/wav",
             transcript=self.transcript,
+            description=self.description,
             filename=filename,
         )
 

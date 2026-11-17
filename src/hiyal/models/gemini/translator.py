@@ -177,7 +177,7 @@ class GeminiTranslator(Translator):
             text=self.text(buffers[0].contents) if buffers else "",
             messages=[message for buffer in buffers for message in buffer.messages()],
             provider=self.info.provider,
-            id_=response.response_id or "",
+            id_=response.response_id or Identifiers.generate_id("gemini"),
             model=response.model_version or model or "",
             created_at=response.create_time or created_at or datetime.now(timezone.utc),
             status="incomplete"
@@ -289,11 +289,13 @@ class CandidateBuffer:
         ):
             return None
         if isinstance(content, ToolCallContent):
-            native = content.data.raw.function_call
-            index = self.tool_indexes.get(native.id) if native.id else self.pending_tool
+            # raw is the Part as a dict; its function_call holds the call's ID.
+            native = (content.data.raw or {}).get("function_call") or {}
+            call_id = native.get("id")
+            index = self.tool_indexes.get(call_id) if call_id else self.pending_tool
             if index is not None:
                 previous = cast(ToolCall, self.contents[index].data)
-                if native.id or content.data.name in {None, previous.name}:
+                if call_id or content.data.name in {None, previous.name}:
                     issue = previous.issue or content.data.issue
                     updates = {
                         "raw": previous.raw,
@@ -307,7 +309,7 @@ class CandidateBuffer:
                     self.contents[index] = ToolCallContent(
                         data=content.data.model_copy(update=updates)
                     )
-                    self.pending_tool = index if native.will_continue else None
+                    self.pending_tool = index if native.get("will_continue") else None
                     return index
         # Gemini has no cross-chunk content-part IDs. Consecutive text/thought
         # fragments of the same kind belong to one logical content block.
@@ -333,11 +335,11 @@ class CandidateBuffer:
             self.contents.append(content)
             self.ids.append(Identifiers.generate_id("item"))
             if isinstance(content, ToolCallContent):
-                native = content.data.raw.function_call
-                if native.id:
-                    self.tool_indexes[native.id] = len(self.contents) - 1
+                native = (content.data.raw or {}).get("function_call") or {}
+                if native.get("id"):
+                    self.tool_indexes[native["id"]] = len(self.contents) - 1
                 self.pending_tool = (
-                    len(self.contents) - 1 if native.will_continue else None
+                    len(self.contents) - 1 if native.get("will_continue") else None
                 )
         return len(self.contents) - 1
 
@@ -464,7 +466,7 @@ class GeminiStreamAccumulator(StreamAccumulator[GeminiTranslator]):
             text=self.translator.text(buffers[0].contents) if buffers else "",
             messages=[message for buffer in buffers for message in buffer.messages()],
             provider=self.translator.info.provider,
-            id_=self.response_id or "",
+            id_=self.response_id or Identifiers.generate_id("gemini"),
             model=self.model or "",
             created_at=self.created_at,
             status=status,

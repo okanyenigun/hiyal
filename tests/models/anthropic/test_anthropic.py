@@ -241,6 +241,10 @@ def stream(events_body, **settings):
 
 
 class TestStreaming:
+    def test_stream_without_message_start_gets_a_generated_id(self):
+        events, _ = stream(sse([{"type": "message_stop"}]))
+        assert events[-1].response.id_.startswith("anthropic_")
+
     def test_text_thinking_and_tool_json(self):
         events, requests = stream(stream_body(
             block(0, {"type": "thinking", "thinking": "", "signature": ""}),
